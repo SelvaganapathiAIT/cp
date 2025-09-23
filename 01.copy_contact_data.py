@@ -54,12 +54,13 @@ logger.info("=" * 80)
 # Import models
 from cp.models import (
     Company, Contact, User, ContactNote, ContactPhone, CFieldValue, CField, 
-    CFieldTable, CFieldMultiValue, CFieldOption, ContactType, ContactCompany, 
-    PhoneType, ContactImage, ContactLabel, ContactPersonnel, ContactRep, 
-    ContactResearch, ContactStore, ContactUserFile, ContactPhoneLabel, 
-    DealerStore, Label, PeopleRole, ContactPhonePersonnel, 
+    CFieldTable, CFieldMultiValue, CFieldOption, CFieldType, CFieldAuto, AutoAction,
+    ContactType, ContactCompany, PhoneType, ContactImage, ContactLabel, 
+    ContactPersonnel, ContactRep, ContactResearch, ContactStore, ContactUserFile, 
+    ContactPhoneLabel, DealerStore, Label, PeopleRole, ContactPhonePersonnel, 
     ContactRegularFieldsStates, ContactListCust, ContactMenu, EventForm,
-    ContactEventForm, EventFormCField, Appointment, Opp, OppStage, OppType, OppContact, OppPersonnel, OppHistory,OppFormCField
+    ContactEventForm, EventFormCField, Appointment, Opp, OppStage, OppType, 
+    OppContact, OppPersonnel, OppHistory, OppFormCField
 )
 
 
@@ -86,6 +87,385 @@ class ContactStats:
     stores_copied: int = 0
     custom_fields_copied: int = 0
     errors: List[str] = field(default_factory=list)
+
+
+class CustomFieldHandler:
+    """Common class for handling custom field operations with parameters"""
+    
+    def __init__(self, source_company, target_company, source_user, target_user, logger):
+        self.source_company = source_company
+        self.target_company = target_company
+        self.source_user = source_user
+        self.target_user = target_user
+        self.logger = logger
+        
+        # Mapping dictionaries for custom field relationships
+        self.cfield_index = {}
+        self.cfield_option_index = {}
+        self.cfield_table_cache = {}
+        self.stats = {
+            'custom_fields_copied': 0,
+            'custom_field_values_copied': 0,
+            'custom_field_multi_values_copied': 0,
+            'custom_field_options_copied': 0,
+            'custom_field_autos_copied': 0,
+            'errors': []
+        }
+
+    def get_or_create_cfield_table(self, table_name):
+        """Get or create CFieldTable by name"""
+        if table_name not in self.cfield_table_cache:
+            try:
+                table = CFieldTable.objects.filter(name=table_name).first()
+                if not table:
+                    table = CFieldTable.objects.create(name=table_name)
+                    self.logger.info(f"Created new CFieldTable: {table_name}")
+                self.cfield_table_cache[table_name] = table
+            except Exception as e:
+                self.logger.error(f"Error getting/creating CFieldTable {table_name}: {e}")
+                return None
+        return self.cfield_table_cache[table_name]
+
+    def get_or_create_cfield(self, source_cfield, table_name=None):
+        """Get or create CField in target company with optional table override"""
+        try:
+            # Use provided table_name or source cfield's table
+            if table_name:
+                target_table = self.get_or_create_cfield_table(table_name)
+            else:
+                target_table = source_cfield.cfield_table
+            
+            if not target_table:
+                self.logger.warning(f"No valid CFieldTable found for field {source_cfield.name}")
+                return None
+
+            # Check if already mapped
+            cache_key = f"{source_cfield.id}_{table_name or 'original'}"
+            if cache_key in self.cfield_index:
+                try:
+                    return CField.objects.get(pk=self.cfield_index[cache_key])
+                except CField.DoesNotExist:
+                    del self.cfield_index[cache_key]
+
+            # Try to find existing CField
+            target_cfield = CField.objects.filter(
+                company=self.target_company,
+                name=source_cfield.name,
+                cfield_table=target_table
+            ).first()
+
+            if target_cfield:
+                self.logger.debug(f"Found existing CField: {target_cfield.name}")
+                self.cfield_index[cache_key] = target_cfield.id
+                return target_cfield
+
+            # Handle parent cfield if exists
+            parent_cfield = None
+            if source_cfield.cfield:
+                parent_cfield = self.get_or_create_cfield(source_cfield.cfield, table_name)
+
+            # Create new CField
+            target_cfield = CField.objects.create(
+                company=self.target_company,
+                name=source_cfield.name,
+                cfield_table=target_table,
+                cfield_type=source_cfield.cfield_type,
+                rfield=source_cfield.rfield,
+                cfield=parent_cfield,
+                position=source_cfield.position,
+                points=source_cfield.points,
+                hide_on_checkout=source_cfield.hide_on_checkout,
+                required=source_cfield.required,
+                lock=source_cfield.lock
+            )
+
+            self.logger.info(f"Created CField: {target_cfield.name} for table {target_table.name}")
+            self.cfield_index[cache_key] = target_cfield.id
+            self.stats['custom_fields_copied'] += 1
+
+            # Copy options for this field
+            self._copy_cfield_options(source_cfield, target_cfield)
+
+            return target_cfield
+
+        except Exception as e:
+            error_msg = f"Error creating CField {source_cfield.name}: {e}"
+            self.logger.error(error_msg)
+            self.stats['errors'].append(error_msg)
+            return None
+
+    def _copy_cfield_options(self, source_cfield, target_cfield):
+        """Copy CFieldOption records for a given CField"""
+        try:
+            source_options = CFieldOption.objects.filter(cfield=source_cfield)
+            for source_option in source_options:
+                # Check if option already exists
+                if not CFieldOption.objects.filter(
+                    cfield=target_cfield,
+                    name=source_option.name
+                ).exists():
+                    target_option = CFieldOption.objects.create(
+                        cfield=target_cfield,
+                        name=source_option.name,
+                        position=source_option.position,
+                        points=source_option.points
+                    )
+                    self.cfield_option_index[source_option.id] = target_option.id
+                    self.stats['custom_field_options_copied'] += 1
+                    self.logger.debug(f"Created CFieldOption: {target_option.name}")
+
+        except Exception as e:
+            self.logger.error(f"Error copying CField options: {e}")
+
+    def copy_cfield_values(self, source_entity_id, target_entity_id, table_name, source_cfields=None):
+        """
+        Copy CFieldValue records for a specific entity
+        
+        Args:
+            source_entity_id: ID of the source entity
+            target_entity_id: ID of the target entity  
+            table_name: Name of the CFieldTable (e.g., 'contact', 'event_form', 'opp')
+            source_cfields: Optional list of specific CFields to copy, if None copies all
+        """
+        try:
+            target_table = self.get_or_create_cfield_table(table_name)
+            if not target_table:
+                return
+
+            # Build query filters
+            query_filters = {
+                'entity_id': source_entity_id,
+                'cfield__cfield_table': target_table
+            }
+            
+            # If specific cfields provided, filter by them
+            if source_cfields:
+                query_filters['cfield__in'] = source_cfields
+
+            # Copy CFieldValue records
+            source_values = CFieldValue.objects.filter(**query_filters)
+            
+            for source_value in source_values:
+                try:
+                    target_cfield = self.get_or_create_cfield(source_value.cfield, table_name)
+                    if not target_cfield:
+                        continue
+
+                    # Check if value already exists
+                    if not CFieldValue.objects.filter(
+                        cfield=target_cfield,
+                        entity_id=target_entity_id,
+                        cf_value=source_value.cf_value
+                    ).exists():
+                        CFieldValue.objects.create(
+                            cfield=target_cfield,
+                            entity_id=target_entity_id,
+                            cf_value=source_value.cf_value,
+                            updated=source_value.updated or timezone.now()
+                        )
+                        self.stats['custom_field_values_copied'] += 1
+                        self.logger.debug(f"Copied CFieldValue for field {target_cfield.name}")
+
+                except Exception as e:
+                    self.logger.error(f"Error copying CFieldValue: {e}")
+
+        except Exception as e:
+            self.logger.error(f"Error copying CField values for {table_name}: {e}")
+
+    def copy_cfield_multi_values(self, source_entity_id, target_entity_id, table_name, source_cfields=None):
+        """
+        Copy CFieldMultiValue records for a specific entity
+        
+        Args:
+            source_entity_id: ID of the source entity
+            target_entity_id: ID of the target entity
+            table_name: Name of the CFieldTable (e.g., 'contact', 'event_form', 'opp')
+            source_cfields: Optional list of specific CFields to copy, if None copies all
+        """
+        try:
+            target_table = self.get_or_create_cfield_table(table_name)
+            if not target_table:
+                return
+
+            # Build query filters
+            query_filters = {
+                'entity_id': source_entity_id,
+                'cfield__cfield_table': target_table
+            }
+            
+            # If specific cfields provided, filter by them
+            if source_cfields:
+                query_filters['cfield__in'] = source_cfields
+
+            # Copy CFieldMultiValue records
+            source_multi_values = CFieldMultiValue.objects.filter(**query_filters)
+            
+            for source_multi_value in source_multi_values:
+                try:
+                    target_cfield = self.get_or_create_cfield(source_multi_value.cfield, table_name)
+                    if not target_cfield:
+                        continue
+
+                    # Get or create target option
+                    target_option = CFieldOption.objects.filter(
+                        cfield=target_cfield,
+                        name=source_multi_value.option.name
+                    ).first()
+
+                    if not target_option:
+                        target_option = CFieldOption.objects.create(
+                            cfield=target_cfield,
+                            name=source_multi_value.option.name,
+                            position=source_multi_value.option.position or 0,
+                            points=source_multi_value.option.points
+                        )
+                        self.stats['custom_field_options_copied'] += 1
+
+                    # Check if multi-value already exists
+                    if not CFieldMultiValue.objects.filter(
+                        cfield=target_cfield,
+                        entity_id=target_entity_id,
+                        option=target_option
+                    ).exists():
+                        CFieldMultiValue.objects.create(
+                            cfield=target_cfield,
+                            entity_id=target_entity_id,
+                            option=target_option,
+                            updated=source_multi_value.updated or timezone.now()
+                        )
+                        self.stats['custom_field_multi_values_copied'] += 1
+                        self.logger.debug(f"Copied CFieldMultiValue for field {target_cfield.name}")
+
+                except Exception as e:
+                    self.logger.error(f"Error copying CFieldMultiValue: {e}")
+
+        except Exception as e:
+            self.logger.error(f"Error copying CField multi values for {table_name}: {e}")
+
+    def copy_event_form_cfields(self, source_event_form, target_event_form):
+        """Copy EventFormCField relationships"""
+        try:
+            source_form_fields = EventFormCField.objects.filter(event_form=source_event_form)
+            
+            for source_form_field in source_form_fields:
+                try:
+                    target_cfield = self.get_or_create_cfield(source_form_field.cfield, 'event_form')
+                    if not target_cfield:
+                        continue
+
+                    # Check if relationship already exists
+                    if not EventFormCField.objects.filter(
+                        event_form=target_event_form,
+                        cfield=target_cfield
+                    ).exists():
+                        EventFormCField.objects.create(
+                            event_form=target_event_form,
+                            cfield=target_cfield,
+                            position=source_form_field.position
+                        )
+                        self.logger.debug(f"Created EventFormCField for {target_cfield.name}")
+
+                except Exception as e:
+                    self.logger.error(f"Error copying EventFormCField: {e}")
+
+        except Exception as e:
+            self.logger.error(f"Error copying event form cfields: {e}")
+
+    def copy_opp_form_cfields(self, source_company=None, target_company=None):
+        """Copy OppFormCField relationships"""
+        try:
+            source_comp = source_company or self.source_company
+            target_comp = target_company or self.target_company
+            
+            source_opp_fields = OppFormCField.objects.filter(company=source_comp)
+            
+            for source_opp_field in source_opp_fields:
+                try:
+                    target_cfield = self.get_or_create_cfield(source_opp_field.cfield, 'opp')
+                    if not target_cfield:
+                        continue
+
+                    # Check if relationship already exists
+                    if not OppFormCField.objects.filter(
+                        company=target_comp,
+                        cfield=target_cfield
+                    ).exists():
+                        OppFormCField.objects.create(
+                            company=target_comp,
+                            cfield=target_cfield,
+                            position=source_opp_field.position
+                        )
+                        self.logger.debug(f"Created OppFormCField for {target_cfield.name}")
+
+                except Exception as e:
+                    self.logger.error(f"Error copying OppFormCField: {e}")
+
+        except Exception as e:
+            self.logger.error(f"Error copying opp form cfields: {e}")
+
+    def copy_cfield_autos(self, table_name=None):
+        """Copy CFieldAuto records"""
+        try:
+            query_filters = {'company': self.source_company}
+            if table_name:
+                target_table = self.get_or_create_cfield_table(table_name)
+                if target_table:
+                    query_filters['cfield__cfield_table'] = target_table
+
+            source_autos = CFieldAuto.objects.filter(**query_filters)
+            
+            for source_auto in source_autos:
+                try:
+                    # Get target cfields
+                    target_cfield = self.get_or_create_cfield(source_auto.cfield, table_name)
+                    target_cfield_1 = self.get_or_create_cfield(source_auto.cfield_1, table_name)
+                    target_cfield_2 = self.get_or_create_cfield(source_auto.cfield_2, table_name)
+                    
+                    if not all([target_cfield, target_cfield_1, target_cfield_2]):
+                        continue
+
+                    # Check if auto already exists
+                    if not CFieldAuto.objects.filter(
+                        company=self.target_company,
+                        cfield=target_cfield,
+                        cfield_1=target_cfield_1,
+                        cfield_2=target_cfield_2
+                    ).exists():
+                        CFieldAuto.objects.create(
+                            company=self.target_company,
+                            cfield=target_cfield,
+                            action=source_auto.action,
+                            cfield_1=target_cfield_1,
+                            cfield_2=target_cfield_2,
+                            hide=source_auto.hide
+                        )
+                        self.stats['custom_field_autos_copied'] += 1
+                        self.logger.debug(f"Created CFieldAuto for {target_cfield.name}")
+
+                except Exception as e:
+                    self.logger.error(f"Error copying CFieldAuto: {e}")
+
+        except Exception as e:
+            self.logger.error(f"Error copying CField autos: {e}")
+
+    def copy_all_custom_fields_for_entity(self, source_entity_id, target_entity_id, table_name):
+        """
+        Convenience method to copy all custom field data for an entity
+        
+        Args:
+            source_entity_id: ID of the source entity
+            target_entity_id: ID of the target entity
+            table_name: Name of the CFieldTable (e.g., 'contact', 'event_form', 'opp')
+        """
+        self.logger.info(f"Copying all custom fields for {table_name} entity {source_entity_id} -> {target_entity_id}")
+        
+        # Copy field values and multi-values
+        self.copy_cfield_values(source_entity_id, target_entity_id, table_name)
+        self.copy_cfield_multi_values(source_entity_id, target_entity_id, table_name)
+
+    def get_stats(self):
+        """Return statistics about custom field copying"""
+        return self.stats.copy()
 
 
 class ContactDataCopier:
@@ -121,6 +501,15 @@ class ContactDataCopier:
         self.appointment_index = {}
         self.opportunity_index = {}
         self.custom_field_index = {}
+        
+        # Initialize CustomFieldHandler
+        self.custom_field_handler = CustomFieldHandler(
+            self.source_company, 
+            self.target_company, 
+            self.source_user, 
+            self.target_user, 
+            logger
+        )
         
         logger.info(f"Source User: {self.source_user.first_name} {self.source_user.last_name}")
         logger.info(f"Target User: {self.target_user.first_name} {self.target_user.last_name}")
@@ -972,121 +1361,23 @@ class ContactDataCopier:
                 logger.error(f"Error copying contact user file: {e}")
 
     def _copy_contact_custom_fields(self, source_contact, target_contact):
-        """Copy custom fields (CFieldValue and CFieldMultiValue) for contacts"""
+        """Copy custom fields (CFieldValue and CFieldMultiValue) for contacts using CustomFieldHandler"""
         try:
-            # Copy CFieldValue records for contact fields only
-            contact_table = CFieldTable.objects.filter(name='contact').first()
-            if not contact_table:
-                logger.warning("Contact CFieldTable not found")
-                return
-            
-            # Copy CFieldValue records
-            cfield_values = CFieldValue.objects.filter(
-                entity_id=source_contact.id,
-                cfield__cfield_table=contact_table
+            # Use the common CustomFieldHandler to copy all custom field data
+            self.custom_field_handler.copy_all_custom_fields_for_entity(
+                source_contact.id, 
+                target_contact.id, 
+                'contact'
             )
             
-            for cfv in cfield_values:
-                try:
-                    # Get or create target CField
-                    target_cfield = CField.objects.filter(
-                        company=self.target_company,
-                        name=cfv.cfield.name,
-                        cfield_table=contact_table
-                    ).first()
-                    
-                    if not target_cfield:
-                        target_cfield = CField.objects.create(
-                            company=self.target_company,
-                            name=cfv.cfield.name,
-                            cfield_table=contact_table,
-                            cfield_type=cfv.cfield.cfield_type,
-                            position=cfv.cfield.position,
-                            points=cfv.cfield.points,
-                            hide_on_checkout=cfv.cfield.hide_on_checkout,
-                            required=cfv.cfield.required,
-                            lock=cfv.cfield.lock,
-                            rfield=cfv.cfield.rfield
-                        )
-                    
-                    # Check if CFieldValue already exists
-                    if not CFieldValue.objects.filter(
-                        cfield=target_cfield,
-                        entity_id=target_contact.id,
-                        cf_value=cfv.cf_value
-                    ).exists():
-                        CFieldValue.objects.create(
-                            cfield=target_cfield,
-                            entity_id=target_contact.id,
-                            cf_value=cfv.cf_value,
-                            updated=cfv.updated or timezone.now()
-                        )
-                        self.stats.custom_fields_copied += 1
-                        self.custom_field_index[cfv.id] = target_cfield.id
-                        
-                except Exception as e:
-                    logger.error(f"Error copying CFieldValue: {e}")
-            
-            # Copy CFieldMultiValue records
-            cfield_multi_values = CFieldMultiValue.objects.filter(
-                entity_id=source_contact.id,
-                cfield__cfield_table=contact_table
+            # Update our stats from the handler's stats
+            handler_stats = self.custom_field_handler.get_stats()
+            self.stats.custom_fields_copied += (
+                handler_stats['custom_fields_copied'] + 
+                handler_stats['custom_field_values_copied'] + 
+                handler_stats['custom_field_multi_values_copied']
             )
             
-            for cfmv in cfield_multi_values:
-                try:
-                    # Get or create target CField
-                    target_cfield = CField.objects.filter(
-                        company=self.target_company,
-                        name=cfmv.cfield.name,
-                        cfield_table=contact_table
-                    ).first()
-                    
-                    if not target_cfield:
-                        target_cfield = CField.objects.create(
-                            company=self.target_company,
-                            name=cfmv.cfield.name,
-                            cfield_table=contact_table,
-                            cfield_type=cfmv.cfield.cfield_type,
-                            position=cfmv.cfield.position,
-                            points=cfmv.cfield.points,
-                            hide_on_checkout=cfmv.cfield.hide_on_checkout,
-                            required=cfmv.cfield.required,
-                            lock=cfmv.cfield.lock,
-                            rfield=cfmv.cfield.rfield
-                        )
-                    
-                    # Get or create target option
-                    target_option = CFieldOption.objects.filter(
-                        cfield=target_cfield,
-                        name=cfmv.option.name
-                    ).first()
-                    
-                    if not target_option:
-                        target_option = CFieldOption.objects.create(
-                            cfield=target_cfield,
-                            name=cfmv.option.name,
-                            position=cfmv.option.position or 0,
-                            points=cfmv.option.points
-                        )
-                    
-                    # Check if multi-value already exists
-                    if not CFieldMultiValue.objects.filter(
-                        cfield=target_cfield,
-                        entity_id=target_contact.id,
-                        option=target_option
-                    ).exists():
-                        CFieldMultiValue.objects.create(
-                            cfield=target_cfield,
-                            entity_id=target_contact.id,
-                            option=target_option,
-                            updated=cfmv.updated or timezone.now()
-                        )
-                        self.stats.custom_fields_copied += 1
-                        self.custom_field_index[cfmv.id] = target_cfield.id
-                except Exception as e:
-                    logger.error(f"Error copying CFieldMultiValue: {e}")
-                    
         except Exception as e:
             logger.error(f"Error copying contact custom fields: {e}")
 
@@ -1098,6 +1389,10 @@ class ContactDataCopier:
         logger.info("-" * 80)
         
         try:
+            # First copy company-level custom field configurations
+            self._copy_company_custom_field_configs()
+            logger.info("Company custom field configurations copied successfully!")
+            
             self.copy_contacts()
             logger.info("Contact data copy completed successfully!")
             self._copy_appointments(self.source_company, self.target_company)
@@ -1112,6 +1407,26 @@ class ContactDataCopier:
             self.stats.errors.append(error_msg)
         
         return self.stats
+
+    def _copy_company_custom_field_configs(self):
+        """Copy company-level custom field configurations"""
+        try:
+            logger.info("Copying company-level custom field configurations...")
+            
+            # Copy OppFormCField configurations
+            self.custom_field_handler.copy_opp_form_cfields()
+            
+            # Copy CFieldAuto configurations for all table types
+            self.custom_field_handler.copy_cfield_autos('contact')
+            self.custom_field_handler.copy_cfield_autos('event_form') 
+            self.custom_field_handler.copy_cfield_autos('opp')
+            
+            # Get updated stats
+            handler_stats = self.custom_field_handler.get_stats()
+            logger.info(f"Copied {handler_stats['custom_field_autos_copied']} CFieldAuto configurations")
+            
+        except Exception as e:
+            logger.error(f"Error copying company custom field configurations: {e}")
     
     @transaction.atomic
     def copy_user_opportunities(self):
@@ -1179,6 +1494,9 @@ class ContactDataCopier:
                 logger.info(f'opportunities Related tables copied {new_opp} daata')
                 self.stats.opps_copied += 1
                 self._copy_opp_related_data(opp, new_opp)
+                
+                # Copy opportunity custom fields
+                self._copy_opp_custom_fields(opp, new_opp)
                 
             except Exception as e:
                 error_msg = f"Error creating opportunity {opp.id}: {e}"
@@ -1262,6 +1580,27 @@ class ContactDataCopier:
         except Exception as e:
             logger.error(f"Error copying OppPersonnel: {e}")
 
+    def _copy_opp_custom_fields(self, source_opp, target_opp):
+        """Copy custom fields for opportunities using CustomFieldHandler"""
+        try:
+            # Use the common CustomFieldHandler to copy all custom field data
+            self.custom_field_handler.copy_all_custom_fields_for_entity(
+                source_opp.id, 
+                target_opp.id, 
+                'opp'
+            )
+            
+            # Update our stats from the handler's stats
+            handler_stats = self.custom_field_handler.get_stats()
+            self.stats.custom_fields_copied += (
+                handler_stats['custom_fields_copied'] + 
+                handler_stats['custom_field_values_copied'] + 
+                handler_stats['custom_field_multi_values_copied']
+            )
+            
+        except Exception as e:
+            logger.error(f"Error copying opportunity custom fields: {e}")
+
     def print_summary(self):
         """Print summary of copied data"""
         logger.info("=" * 80)
@@ -1290,6 +1629,15 @@ class ContactDataCopier:
         logger.info(f"  • Event Forms: {self.stats.event_forms_copied}")
         logger.info(f"  • Contact Event Forms: {self.stats.contact_event_forms_copied}")
         logger.info(f"  • Opportunities: {self.stats.opps_copied}")
+        
+        # Add custom field handler stats
+        handler_stats = self.custom_field_handler.get_stats()
+        logger.info("\nCUSTOM FIELD DATA:")
+        logger.info(f"  • Custom Fields Created: {handler_stats['custom_fields_copied']}")
+        logger.info(f"  • Custom Field Values: {handler_stats['custom_field_values_copied']}")
+        logger.info(f"  • Custom Field Multi Values: {handler_stats['custom_field_multi_values_copied']}")
+        logger.info(f"  • Custom Field Options: {handler_stats['custom_field_options_copied']}")
+        logger.info(f"  • Custom Field Autos: {handler_stats['custom_field_autos_copied']}")
         
         if self.stats.errors:
             logger.info(f"\nERRORS ENCOUNTERED: {len(self.stats.errors)}")
@@ -1400,68 +1748,11 @@ class ContactDataCopier:
                     )
                     self.stats.event_forms_copied += 1
 
-                    # Copy EventFormCFields
-                    source_event_form_fields = EventFormCField.objects.filter(
-                        event_form=source_contact_event_form.event_form
+                    # Copy EventFormCFields using CustomFieldHandler
+                    self.custom_field_handler.copy_event_form_cfields(
+                        source_contact_event_form.event_form, 
+                        target_event_form
                     )
-                    for source_event_form_field in source_event_form_fields:
-                        source_field = source_event_form_field.cfield
-                        parent_field = None
-
-                        # Copy parent CField if exists
-                        if source_field.cfield:
-                            parent_source_field = source_field.cfield
-                            parent_field, _ = CField.objects.get_or_create(
-                                company=target_company,
-                                name=parent_source_field.name,
-                                cfield_table=parent_source_field.cfield_table,
-                                cfield_type=parent_source_field.cfield_type,
-                                rfield=parent_source_field.rfield,
-                                cfield=None,
-                                position=parent_source_field.position,
-                                points=parent_source_field.points,
-                                hide_on_checkout=parent_source_field.hide_on_checkout,
-                                required=parent_source_field.required,
-                                lock=parent_source_field.lock,
-                            )
-                            # Copy parent field options
-                            for parent_option in CFieldOption.objects.filter(cfield=parent_source_field):
-                                CFieldOption.objects.create(
-                                    cfield=parent_field,
-                                    name=parent_option.name,
-                                    position=parent_option.position,
-                                    points=parent_option.points,
-                                )
-
-                        # Copy current CField
-                        target_field, _ = CField.objects.get_or_create(
-                            company=target_company,
-                            name=source_field.name,
-                            cfield_table=source_field.cfield_table,
-                            cfield_type=source_field.cfield_type,
-                            rfield=source_field.rfield,
-                            cfield=parent_field,
-                            position=source_field.position,
-                            points=source_field.points,
-                            hide_on_checkout=source_field.hide_on_checkout,
-                            required=source_field.required,
-                            lock=source_field.lock,
-                        )
-
-                        # Copy current field options
-                        for source_option in CFieldOption.objects.filter(cfield=source_field):
-                            CFieldOption.objects.create(
-                                cfield=target_field,
-                                name=source_option.name,
-                                position=source_option.position,
-                                points=source_option.points,
-                            )
-
-                        EventFormCField.objects.create(
-                            event_form=target_event_form,
-                            cfield=target_field,
-                            position=source_event_form_field.position,
-                        )
                 except Exception as e:
                     logger.error(f"Error copying EventForm: {e}")
                     continue
@@ -1490,52 +1781,12 @@ class ContactDataCopier:
                 logger.error(f"Error copying ContactEventForm: {e}")
                 continue
 
-            # Copy CFieldValue entries
-            source_field_values = CFieldValue.objects.filter(entity_id=source_contact_event_form.id)
-            for source_value in source_field_values:
-                try:
-                    target_field = CField.objects.filter(
-                        name=source_value.cfield.name,
-                        company=target_company,
-                        eventformcfield__event_form=target_event_form
-                    ).first()
-                except CField.DoesNotExist:
-                    target_field = None
-
-                if target_field:
-                    try:
-                        CFieldValue.objects.create(
-                            cfield=target_field,
-                            entity_id=target_contact_event_form.id,
-                            cf_value=source_value.cf_value,
-                            updated=source_value.updated,
-                        )
-                    except Exception as e:
-                        logger.warning(f"Could not copy CFieldValue: {e}")
-
-            # Copy CFieldMultiValue entries
-            source_multi_values = CFieldMultiValue.objects.filter(entity_id=source_contact_event_form.id)
-            for source_multi_value in source_multi_values:
-                try:
-                    target_field = CField.objects.filter(
-                        name=source_multi_value.cfield.name,
-                        eventformcfield__event_form=target_event_form
-                    ).first()
-                    target_options = CFieldOption.objects.filter(cfield=target_field) if target_field else []
-                except Exception:
-                    target_field = None
-                    target_options = []
-
-                for target_option in target_options:
-                    try:
-                        CFieldMultiValue.objects.create(
-                            cfield=target_field,
-                            entity_id=target_contact_event_form.id,
-                            option=target_option,
-                            updated=source_multi_value.updated,
-                        )
-                    except Exception as e:
-                        logger.warning(f"Could not copy CFieldMultiValue: {e}")
+            # Copy CFieldValue and CFieldMultiValue entries using CustomFieldHandler
+            self.custom_field_handler.copy_all_custom_fields_for_entity(
+                source_contact_event_form.id,
+                target_contact_event_form.id,
+                'event_form'
+            )
 
 def parse_arguments() -> Tuple[int, int]:
     """Parse and validate command line arguments"""
@@ -1615,6 +1866,64 @@ def main():
         sys.exit(1)
     finally:
         cleanup_process_lock(pid_file)
+
+
+def example_custom_field_usage():
+    """
+    Example showing how to use CustomFieldHandler independently
+    """
+    # Example usage of CustomFieldHandler for different scenarios
+    
+    # Initialize handler
+    source_company = Company.objects.get(pk=1)  # Replace with actual company ID
+    target_company = Company.objects.get(pk=2)  # Replace with actual company ID
+    source_user = User.objects.get(pk=1)        # Replace with actual user ID
+    target_user = User.objects.get(pk=2)        # Replace with actual user ID
+    
+    handler = CustomFieldHandler(
+        source_company, 
+        target_company, 
+        source_user, 
+        target_user, 
+        logger
+    )
+    
+    # Example 1: Copy all custom fields for a contact
+    # handler.copy_all_custom_fields_for_entity(
+    #     source_entity_id=123,  # Source contact ID
+    #     target_entity_id=456,  # Target contact ID
+    #     table_name='contact'
+    # )
+    
+    # Example 2: Copy custom fields for an opportunity
+    # handler.copy_all_custom_fields_for_entity(
+    #     source_entity_id=789,  # Source opportunity ID
+    #     target_entity_id=101,  # Target opportunity ID
+    #     table_name='opp'
+    # )
+    
+    # Example 3: Copy custom fields for an event form
+    # handler.copy_all_custom_fields_for_entity(
+    #     source_entity_id=112,  # Source event form ID
+    #     target_entity_id=113,  # Target event form ID
+    #     table_name='event_form'
+    # )
+    
+    # Example 4: Copy company-level configurations
+    # handler.copy_opp_form_cfields()
+    # handler.copy_cfield_autos('contact')
+    
+    # Example 5: Copy event form field relationships
+    # source_event_form = EventForm.objects.get(pk=1)
+    # target_event_form = EventForm.objects.get(pk=2)
+    # handler.copy_event_form_cfields(source_event_form, target_event_form)
+    
+    # Get statistics
+    stats = handler.get_stats()
+    print("Custom Field Copy Statistics:")
+    for key, value in stats.items():
+        if key != 'errors':
+            print(f"  {key}: {value}")
 
 
 if __name__ == "__main__":
