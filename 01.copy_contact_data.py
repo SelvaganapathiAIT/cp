@@ -153,6 +153,21 @@ class CustomFieldHandler:
                 name=source_cfield.name,
                 cfield_table=target_table
             ).first()
+            
+            # If not found and this is for event_form, also check if there's a field
+            # with the same name but different table that we can use
+            if not target_cfield and table_name == 'event_form':
+                # Look for fields with same name in contact table (common for EventForms)
+                fallback_cfield = CField.objects.filter(
+                    company=self.target_company,
+                    name=source_cfield.name
+                ).first()
+                
+                if fallback_cfield:
+                    self.logger.debug(f"Found fallback CField {fallback_cfield.name} with table {fallback_cfield.cfield_table.name}")
+                    # Use the existing field but ensure it's properly cached
+                    self.cfield_index[cache_key] = fallback_cfield.id
+                    return fallback_cfield
 
             if target_cfield:
                 self.logger.debug(f"Found existing CField: {target_cfield.name}")
@@ -343,14 +358,38 @@ class CustomFieldHandler:
             self.logger.error(f"Error copying CField multi values for {table_name}: {e}")
 
     def copy_event_form_cfields(self, source_event_form, target_event_form):
-        """Copy EventFormCField relationships"""
+        """Copy EventFormCField relationships with improved field mapping"""
         try:
             source_form_fields = EventFormCField.objects.filter(event_form=source_event_form)
+            self.logger.info(f"Found {source_form_fields.count()} EventFormCFields to copy from {source_event_form.name}")
             
             for source_form_field in source_form_fields:
                 try:
-                    target_cfield = self.get_or_create_cfield(source_form_field.cfield, 'event_form')
+                    source_cfield = source_form_field.cfield
+                    self.logger.debug(f"Processing EventFormCField: {source_cfield.name} (ID: {source_cfield.id})")
+                    self.logger.debug(f"  - Source cfield_table: {source_cfield.cfield_table.name if source_cfield.cfield_table else 'None'}")
+                    self.logger.debug(f"  - Source cfield_type: {source_cfield.cfield_type.name if source_cfield.cfield_type else 'None'}")
+                    self.logger.debug(f"  - Source rfield: {source_cfield.rfield.name if source_cfield.rfield else 'None'}")
+                    
+                    # Determine the correct table name for the field
+                    table_name = 'event_form'
+                    if source_cfield.cfield_table:
+                        # Use the source field's table name if it exists
+                        original_table_name = source_cfield.cfield_table.name
+                        self.logger.debug(f"  - Original table name: {original_table_name}")
+                        
+                        # For EventForm fields, we want to ensure they use 'event_form' table
+                        # but preserve the original mapping logic for other types
+                        if original_table_name in ['contact', 'opp']:
+                            table_name = original_table_name
+                        else:
+                            table_name = 'event_form'
+                    
+                    self.logger.debug(f"  - Using table name: {table_name}")
+                    
+                    target_cfield = self.get_or_create_cfield(source_cfield, table_name)
                     if not target_cfield:
+                        self.logger.warning(f"Failed to create target CField for {source_cfield.name}")
                         continue
 
                     # Check if relationship already exists
@@ -363,13 +402,19 @@ class CustomFieldHandler:
                             cfield=target_cfield,
                             position=source_form_field.position
                         )
-                        self.logger.debug(f"Created EventFormCField for {target_cfield.name}")
+                        self.logger.info(f"Created EventFormCField for {target_cfield.name} (table: {target_cfield.cfield_table.name})")
+                    else:
+                        self.logger.debug(f"EventFormCField already exists for {target_cfield.name}")
 
                 except Exception as e:
-                    self.logger.error(f"Error copying EventFormCField: {e}")
+                    self.logger.error(f"Error copying EventFormCField for field {source_form_field.cfield.name}: {e}")
+                    import traceback
+                    self.logger.error(f"Traceback: {traceback.format_exc()}")
 
         except Exception as e:
             self.logger.error(f"Error copying event form cfields: {e}")
+            import traceback
+            self.logger.error(f"Traceback: {traceback.format_exc()}")
 
     def copy_opp_form_cfields(self, source_company=None, target_company=None):
         """Copy OppFormCField relationships"""
@@ -459,13 +504,97 @@ class CustomFieldHandler:
         """
         self.logger.info(f"Copying all custom fields for {table_name} entity {source_entity_id} -> {target_entity_id}")
         
-        # Copy field values and multi-values
-        self.copy_cfield_values(source_entity_id, target_entity_id, table_name)
-        self.copy_cfield_multi_values(source_entity_id, target_entity_id, table_name)
+        # For event_form entities, we need to check all possible table types since EventForm
+        # fields might be associated with different CFieldTable types
+        if table_name == 'event_form':
+            # Copy from all relevant table types that might be used in event forms
+            table_types_to_check = ['event_form', 'contact', 'opp']
+            
+            for table_type in table_types_to_check:
+                self.logger.debug(f"Checking for custom fields with table type: {table_type}")
+                
+                # Count existing values before copying
+                existing_values = CFieldValue.objects.filter(
+                    entity_id=source_entity_id,
+                    cfield__cfield_table__name=table_type
+                ).count()
+                
+                existing_multi_values = CFieldMultiValue.objects.filter(
+                    entity_id=source_entity_id,
+                    cfield__cfield_table__name=table_type
+                ).count()
+                
+                if existing_values > 0 or existing_multi_values > 0:
+                    self.logger.info(f"Found {existing_values} CFieldValues and {existing_multi_values} CFieldMultiValues for table type {table_type}")
+                    
+                    # Copy field values and multi-values for this table type
+                    self.copy_cfield_values(source_entity_id, target_entity_id, table_type)
+                    self.copy_cfield_multi_values(source_entity_id, target_entity_id, table_type)
+                else:
+                    self.logger.debug(f"No custom field values found for table type {table_type}")
+        else:
+            # For other entity types, use the standard approach
+            self.copy_cfield_values(source_entity_id, target_entity_id, table_name)
+            self.copy_cfield_multi_values(source_entity_id, target_entity_id, table_name)
 
     def get_stats(self):
         """Return statistics about custom field copying"""
         return self.stats.copy()
+    
+    def debug_event_form_field_mapping(self, source_event_form, target_event_form):
+        """
+        Debug method to analyze EventForm field mapping issues
+        This method will help identify why custom fields are not being mapped properly
+        """
+        self.logger.info("=" * 60)
+        self.logger.info(f"DEBUGGING EventForm Field Mapping")
+        self.logger.info(f"Source EventForm: {source_event_form.name} (ID: {source_event_form.id})")
+        self.logger.info(f"Target EventForm: {target_event_form.name} (ID: {target_event_form.id})")
+        self.logger.info("=" * 60)
+        
+        # Get fields using EventForm.get_cfields() method
+        source_cfields = source_event_form.get_cfields()
+        self.logger.info(f"EventForm.get_cfields() returned {len(source_cfields)} fields:")
+        
+        for i, cfield in enumerate(source_cfields):
+            self.logger.info(f"  {i+1}. Field: {cfield.name} (ID: {cfield.id})")
+            self.logger.info(f"     - Table: {cfield.cfield_table.name if cfield.cfield_table else 'None'}")
+            self.logger.info(f"     - Type: {cfield.cfield_type.name if cfield.cfield_type else 'None'}")
+            self.logger.info(f"     - RField: {cfield.rfield.name if cfield.rfield else 'None'}")
+            self.logger.info(f"     - Parent CField: {cfield.cfield.name if cfield.cfield else 'None'}")
+            
+            # Check if this field has values in the source
+            value_count = CFieldValue.objects.filter(cfield=cfield).count()
+            multi_value_count = CFieldMultiValue.objects.filter(cfield=cfield).count()
+            self.logger.info(f"     - Values in DB: {value_count} CFieldValues, {multi_value_count} CFieldMultiValues")
+        
+        # Check EventFormCField relationships
+        self.logger.info("\nEventFormCField relationships:")
+        source_form_fields = EventFormCField.objects.filter(event_form=source_event_form)
+        self.logger.info(f"Found {source_form_fields.count()} EventFormCField relationships")
+        
+        for efc in source_form_fields:
+            cfield = efc.cfield
+            self.logger.info(f"  - {cfield.name} (pos: {efc.position})")
+            self.logger.info(f"    Table: {cfield.cfield_table.name if cfield.cfield_table else 'None'}")
+            
+            # Check if this field is in the get_cfields() result
+            in_get_cfields = cfield in source_cfields
+            self.logger.info(f"    In get_cfields(): {in_get_cfields}")
+            
+            if not in_get_cfields:
+                self.logger.warning(f"    *** Field {cfield.name} is in EventFormCField but NOT in get_cfields() result!")
+        
+        # Check target EventForm
+        self.logger.info(f"\nTarget EventForm field relationships:")
+        target_form_fields = EventFormCField.objects.filter(event_form=target_event_form)
+        self.logger.info(f"Target has {target_form_fields.count()} EventFormCField relationships")
+        
+        for efc in target_form_fields:
+            cfield = efc.cfield
+            self.logger.info(f"  - {cfield.name} (table: {cfield.cfield_table.name})")
+        
+        self.logger.info("=" * 60)
 
 
 class ContactDataCopier:
@@ -1753,6 +1882,13 @@ class ContactDataCopier:
                         source_contact_event_form.event_form, 
                         target_event_form
                     )
+                    
+                    # Debug the field mapping if there are issues
+                    if logger.level <= logging.DEBUG:
+                        self.custom_field_handler.debug_event_form_field_mapping(
+                            source_contact_event_form.event_form, 
+                            target_event_form
+                        )
                 except Exception as e:
                     logger.error(f"Error copying EventForm: {e}")
                     continue
