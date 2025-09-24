@@ -54,18 +54,19 @@ logger.info("=" * 80)
 # Import models
 from cp.models import (
     Company, Contact, User, ContactNote, ContactPhone, CFieldValue, CField, 
-    CFieldTable, CFieldMultiValue, CFieldOption, CFieldType, CFieldAuto, AutoAction,
+    CFieldTable, CFieldMultiValue, CFieldOption, CFieldAuto,
     ContactType, ContactCompany, PhoneType, ContactImage, ContactLabel, 
     ContactPersonnel, ContactRep, ContactResearch, ContactStore, ContactUserFile, 
     ContactPhoneLabel, DealerStore, Label, PeopleRole, ContactPhonePersonnel, 
     ContactRegularFieldsStates, ContactListCust, ContactMenu, EventForm,
     ContactEventForm, EventFormCField, Appointment, Opp, OppStage, OppType, 
-    OppContact, OppPersonnel, OppHistory, OppFormCField
+    OppContact, OppPersonnel, OppHistory, OppFormCField, ContactEventFormPersonnel,
+    ContactInfoEmail,Followup, FollowupType, FollowupStage, FollowupPriority,
+    FollowupCall, FollowupPersonnel, CalendarEventFollowups,
+    UserFile,  EventFormContactType,EventFormEMail,ReportField,ReportFieldGroupBy
 )
 
-# Import the CustomFieldService for proper custom field handling
-from custom_field_service import CustomFieldService
-
+from cplib.cfield.custom_field_service import CustomFieldService
 
 @dataclass
 class ContactStats:
@@ -92,6 +93,13 @@ class ContactStats:
     opp_histories_copied: int = 0
     opp_contacts_copied: int = 0
     opp_personnels_copied: int = 0
+    followups_copied: int = 0
+    followup_types_copied: int = 0
+    followup_stages_copied: int = 0
+    followup_priorities_copied: int = 0
+    followup_calls_copied: int = 0
+    followup_personnels_copied: int = 0
+    calendar_event_followups_copied: int = 0
     errors: List[str] = field(default_factory=list)
 
 
@@ -749,6 +757,8 @@ class CustomFieldHandler:
         """Return statistics about custom field copying"""
         return self.stats.copy()
     
+
+
     def copy_custom_fields_using_service(self, source_entity_id, target_entity_id, table_name, source_entity=None, target_entity=None):
         """
         Copy custom field values using the CustomFieldService for proper handling of all field types.
@@ -781,65 +791,61 @@ class CustomFieldHandler:
                 return
                 
             self.logger.info(f"Found {source_cfield_values.count()} CFieldValues and {source_cfield_multi_values.count()} CFieldMultiValues to copy")
+
             
-            # Prepare POST data dictionary to simulate form submission
-            post_data = {'entity': str(target_entity_id), 'user': self.target_user}
-            
-            # Process CFieldValue records
+            # Process CFieldValue records (for single value fields including select/radio that store option IDs)
             for source_value in source_cfield_values:
                 try:
+                    self.logger.debug(f"Processing custom field {source_value.cfield} for entity {source_entity_id}")
                     # Get or create the corresponding target custom field
                     source_table_name = source_value.cfield.cfield_table.name if source_value.cfield.cfield_table else table_name
                     target_cfield = self.get_or_create_cfield(source_value.cfield, source_table_name)
                     if not target_cfield:
                         continue
                     
-                    # Handle different field types appropriately
-                    field_key = f'cf_{target_cfield.id}'
                     field_value = source_value.cf_value
+                    self.logger.debug(f"Processing custom field  value {field_value} for entity {source_entity_id}")
+
                     
-                    # Handle different field types with proper value mapping
-                    if target_cfield.cfield_type:
-                        field_type_name = target_cfield.cfield_type.name
-                        
-                        # For select/radio fields that store option IDs, we need to map to target option IDs
-                        if (field_type_name in ['select', 'radio'] and 
-                            field_value and str(field_value).isdigit()):
-                            try:
-                                source_option_id = int(field_value)
-                                source_option = CFieldOption.objects.filter(
-                                    cfield=source_value.cfield, 
-                                    id=source_option_id
-                                ).first()
-                                if source_option:
-                                    target_option = self.get_or_create_cfield_option(source_option, target_cfield)
-                                    if target_option:
-                                        field_value = str(target_option.id)
-                                        self.logger.debug(f"Mapped option {source_option.name} from ID {source_option_id} to {target_option.id}")
-                            except (ValueError, TypeError):
-                                pass  # Keep original value if not a valid option ID
-                        
-                        # For checkbox fields, ensure proper boolean handling
-                        elif field_type_name == 'checkbox':
-                            if field_value in ['1', 'true', 'True', True, 1]:
-                                field_value = '1'
-                            else:
-                                field_value = '0'
-                        
-                        # For date/datetime fields, preserve the format
-                        elif field_type_name in ['date', 'datetime', 'time']:
-                            # The CustomFieldService will handle parsing, just pass through
-                            pass
+                    # Handle select/radio fields that store option IDs in CFieldValue
+                    if (target_cfield.cfield_type and 
+                        target_cfield.cfield_type.name in ['select', 'radio'] and 
+                        field_value and str(field_value).isdigit()):
+                        try:
+                            source_option_id = int(field_value)
+                            source_option = CFieldOption.objects.filter(
+                                cfield=source_value.cfield, 
+                                id=source_option_id
+                            ).first()
+                            if source_option:
+                                target_option = self.get_or_create_cfield_option(source_option, target_cfield)
+                                if target_option:
+                                    field_value = str(target_option.id)
+                                    self.logger.debug(f"Mapped select/radio option {source_option.name} from ID {source_option_id} to {target_option.id}")
+                        except (ValueError, TypeError):
+                            self.logger.warning(f"Invalid option ID for select/radio field: {field_value}")
+                            continue
                     
-                    post_data[field_key] = field_value
-                    self.logger.debug(f"Added field {target_cfield.name} (cf_{target_cfield.id}) = {field_value}")
+                    # Create the target CFieldValue directly (bypassing CustomFieldService for reliability)
+                    if not CFieldValue.objects.filter(
+                        cfield=target_cfield,
+                        entity_id=target_entity_id,
+                        cf_value=field_value
+                    ).exists():
+                        CFieldValue.objects.create(
+                            cfield=target_cfield,
+                            entity_id=target_entity_id,
+                            cf_value=field_value,
+                            updated=source_value.updated or timezone.now()
+                        )
+                        self.stats['custom_field_values_copied'] += 1
+                        self.logger.debug(f"Created CFieldValue for field {target_cfield.name} (ID: {target_cfield.id}) = {field_value}")
                     
                 except Exception as e:
                     self.logger.error(f"Error processing CFieldValue {source_value.id}: {e}")
                     continue
             
             # Process CFieldMultiValue records (for multi-select fields)
-            multi_value_fields = {}
             for source_multi_value in source_cfield_multi_values:
                 try:
                     # Get or create the corresponding target custom field
@@ -853,87 +859,28 @@ class CustomFieldHandler:
                     if not target_option:
                         continue
                     
-                    # Collect multi-value field options
-                    field_key = f'cf_{target_cfield.id}'
-                    if field_key not in multi_value_fields:
-                        multi_value_fields[field_key] = []
-                    multi_value_fields[field_key].append(str(target_option.id))
-                    
-                    self.logger.debug(f"Added multi-value for field {target_cfield.name} (cf_{target_cfield.id}) = option {target_option.name}")
+                    # Create the target CFieldMultiValue directly
+                    if not CFieldMultiValue.objects.filter(
+                        cfield=target_cfield,
+                        entity_id=target_entity_id,
+                        option=target_option
+                    ).exists():
+                        CFieldMultiValue.objects.create(
+                            cfield=target_cfield,
+                            entity_id=target_entity_id,
+                            option=target_option,
+                            updated=source_multi_value.updated or timezone.now()
+                        )
+                        self.stats['custom_field_multi_values_copied'] += 1
+                        self.logger.debug(f"Created CFieldMultiValue for field {target_cfield.name} (ID: {target_cfield.id}) = option {target_option.name}")
                     
                 except Exception as e:
                     self.logger.error(f"Error processing CFieldMultiValue {source_multi_value.id}: {e}")
                     continue
             
-            # Add multi-value fields to POST data
-            for field_key, option_ids in multi_value_fields.items():
-                post_data[field_key] = option_ids
-                self.logger.debug(f"Added multi-value field {field_key} with options: {option_ids}")
-            
-            if len(post_data) <= 2:  # Only 'entity' and 'user' keys
-                self.logger.debug(f"No custom field data to process for {table_name} entity {target_entity_id}")
-                return
-                
-            # Create a mock request object for the CustomFieldService
-            class MockRequest:
-                def __init__(self, post_data):
-                    self.POST = MockPostData(post_data)
-                    
-                def getlist(self, key, default=None):
-                    return self.POST.getlist(key, default)
-            
-            class MockPostData:
-                def __init__(self, data):
-                    self.data = data
-                    
-                def get(self, key, default=None):
-                    return self.data.get(key, default)
-                    
-                def getlist(self, key, default=None):
-                    value = self.data.get(key, default or [])
-                    if isinstance(value, list):
-                        return value
-                    return [value] if value is not None else (default or [])
-                    
-                def __contains__(self, key):
-                    return key in self.data
-                    
-                def __getitem__(self, key):
-                    return self.data[key]
-                    
-                def __setitem__(self, key, value):
-                    self.data[key] = value
-            
-            mock_request = MockRequest(post_data)
-            
-            # Initialize CustomFieldService with the prepared data
-            custom_field_service = CustomFieldService(
-                post=post_data,
-                table=table_name,
-                company=self.target_company,
-                edit=True,  # We're editing/updating the target entity
-                request=mock_request,
-                created_type='copy'  # Indicate this is a copy operation
-            )
-            
-            # Process the custom fields using the service
-            selected, errors = custom_field_service.process()
-            
-            if errors:
-                self.logger.warning(f"CustomFieldService encountered {len(errors)} errors for {table_name} entity {target_entity_id}")
-                for field_key, error_msg in errors.items():
-                    self.logger.error(f"CustomFieldService error for {field_key}: {error_msg}")
-                
-                # Fallback to original method if there are critical errors
-                self.logger.info(f"Falling back to original custom field copy method for {table_name} entity {target_entity_id}")
-                self.copy_all_custom_fields_for_entity(source_entity_id, target_entity_id, table_name)
-            else:
-                self.logger.info(f"Successfully processed {len(post_data) - 2} custom fields using CustomFieldService for {table_name} entity {target_entity_id}")
-                
             # Update statistics
-            fields_processed = len(post_data) - 2  # Exclude 'entity' and 'user' keys
-            self.stats['custom_fields_copied'] += fields_processed
-            
+            self.logger.info(f"Successfully copied custom fields for {table_name} entity {target_entity_id}")
+                
         except Exception as e:
             self.logger.error(f"Error copying custom fields using service for {table_name}: {e}")
             import traceback
@@ -945,7 +892,7 @@ class CustomFieldHandler:
                 self.copy_all_custom_fields_for_entity(source_entity_id, target_entity_id, table_name)
             except Exception as fallback_error:
                 self.logger.error(f"Fallback method also failed for {table_name}: {fallback_error}")
-    
+
     def debug_event_form_field_mapping(self, source_event_form, target_event_form):
         """
         Debug method to analyze EventForm field mapping issues
@@ -1033,8 +980,10 @@ class ContactDataCopier:
         self.phone_type_index = {}
         self.contact_phone_index = {}
         self.appointment_index = {}
+        self.eform_appointment_index = {}
         self.opportunity_index = {}
         self.custom_field_index = {}
+        self.event_form_index = {}
         
         # Initialize CustomFieldHandler
         self.custom_field_handler = CustomFieldHandler(
@@ -1347,6 +1296,11 @@ class ContactDataCopier:
             })
 
             new_contact = Contact.objects.create(**contact_fields)
+            #update the contact company's primary contact if not set
+            if target_contact_company and not target_contact_company.primary_contact:
+                target_contact_company.primary_contact = new_contact
+                target_contact_company.save(update_fields=['primary_contact'])
+                
             self._copy_contact_image(contact, new_contact)
             logger.info(f"Created new contact: {getattr(new_contact, 'first_name', '')} {getattr(new_contact, 'last_name', '')}")
             return new_contact
@@ -1419,15 +1373,58 @@ class ContactDataCopier:
             self._copy_contact_notes(source_contact, target_contact)
             self._copy_contact_images(source_contact, target_contact)
             self._copy_contact_labels(source_contact, target_contact)
+            self._copy_info_email(source_contact, target_contact)
+            self._copy_contact_regular_fields_states()   
+            self._copy_contact_list_cust()
             self._copy_contact_personnel(source_contact, target_contact)
             self._copy_contact_reps(source_contact, target_contact)
             self._copy_contact_research(source_contact, target_contact)
             self._copy_contact_stores(source_contact, target_contact)
             self._copy_contact_user_files(source_contact, target_contact)
             self._copy_contact_custom_fields(source_contact, target_contact)
+           
+            try:
+                self._copy_event_forms(self.source_company, self.target_company, source_contact, target_contact)
+                logger.info("Event form data copy completed successfully!")
+            except Exception as e:
+                error_msg = f"Error copying event forms: {e}"
+                logger.error(error_msg)
+                self.stats.errors.append(error_msg)
+
+            try:
+                self._copy_appointments(self.source_company, self.target_company, source_contact, target_contact)
+                logger.info("Appointment data copy completed successfully!")
+            except Exception as e:
+                error_msg = f"Error copying appointments: {e}"
+                logger.error(error_msg)
+                self.stats.errors.append(error_msg)
             logger.info(f"Successfully copied all related data for contact {source_contact.id}")
         except Exception as e:
             logger.error(f"Error copying contact related data: {e}")
+
+    def _copy_contact_list_cust(self):
+        for clc in ContactListCust.objects.filter(company=self.source_company):
+            # This model doesn't have a direct contact FK, copying by company
+            try:
+                existing = ContactListCust.objects.filter(
+                    company=self.target_company,
+                    contact_name=clc.contact_name,
+                    company_name=clc.company_name
+                ).exists()
+                
+                if not existing:
+                    ContactListCust.objects.create(
+                        company=self.target_company,
+                        contact_name=clc.contact_name,
+                        company_name=clc.company_name,
+                        address=clc.address,
+                        phone_distance=clc.phone_distance,
+                        contacted=clc.contacted,
+                        sales_rep=clc.sales_rep,
+                        last_appointment=clc.last_appointment
+                    )
+            except Exception as e:
+                logger.error(f"Error copying ContactListCust: {e}")
 
     def _copy_contact_phones(self, source_contact, target_contact):
         """Copy ContactPhone records"""
@@ -1457,12 +1454,13 @@ class ContactDataCopier:
                 
                 # Safely handle extension
                 ext_raw = getattr(phone, 'ext', '')
+                print(f"Raw extension value: {repr(ext_raw)} (type: {type(ext_raw)})")
                 if ext_raw is None:
                     ext_str = ''
                 else:
                     ext_str = str(ext_raw) if ext_raw is not None else ''
                 ext = self._safe_str_slice(ext_str, 15)
-                
+                print(f"Processed extension value: {repr(ext)} (type: {type(ext)})")
                 # Skip if no phone number or if it already exists
                 if not phone_number or self._phone_exists(target_contact, phone_number):
                     continue
@@ -1470,6 +1468,10 @@ class ContactDataCopier:
                 phone_type = self._get_phone_type(phone)
                 new_phone = self._create_contact_phone(phone, target_contact, phone_number, ext, phone_type)
                 self.contact_phone_index[phone.id] = new_phone.id
+                is_default_contact_phone = Contact.objects.filter(default_phone=phone, id=source_contact.id).exists()
+                if is_default_contact_phone:
+                    target_contact.default_phone = new_phone
+                    target_contact.save(update_fields=['default_phone'])
                 self.stats.phones_copied += 1
                 self._copy_contact_phone_labels(phone, new_phone)
                 
@@ -1586,7 +1588,6 @@ class ContactDataCopier:
         logger.warning(f"_normalize_datetime: Unexpected type {type(value)} for value: {repr(value)}. Returning None.")
         return None
 
-
     def _copy_contact_phone_labels(self, source_phone, target_phone):
         """Copy ContactPhoneLabel records"""
         phone_labels = ContactPhoneLabel.objects.filter(contact_phone=source_phone)
@@ -1657,7 +1658,7 @@ class ContactDataCopier:
                         company=self.target_company,
                         user=self.target_user,
                         contact=target_contact,
-                        business_card=img.business_card or False,
+                        business_card=img.business_card if img.business_card else None,
                         image=img.image,
                         created=img.created or timezone.now()
                     )
@@ -1709,6 +1710,36 @@ class ContactDataCopier:
                     new_personnel = self._create_personnel(target_contact, cp, peoplerole)
                     self._copy_personnel_image(cp, new_personnel)
                     self.stats.personnel_copied += 1
+                    reverse_index = {v: k for k, v in self.contact_index.items()}
+                    source_contact_id = reverse_index.get(target_contact.id)
+                    for cpp in ContactPhonePersonnel.objects.filter(contactphone__contact=source_contact_id):
+                        try:
+                            # Find corresponding target contact phone
+                            target_contact_phone = ContactPhone.objects.filter(
+                                contact=target_contact,
+                                phone_number=cpp.contactphone.phone_number
+                            ).first()
+                            
+                            # Find corresponding target personnel
+                            target_personnel = ContactPersonnel.objects.filter(
+                                contact=target_contact,
+                                first_name=cpp.personnel.first_name,
+                                last_name=cpp.personnel.last_name
+                            ).first()
+                            
+                            if target_contact_phone and target_personnel:
+                                if not ContactPhonePersonnel.objects.filter(
+                                    contactphone=target_contact_phone,
+                                    personnel=target_personnel
+                                ).exists():
+                                    ContactPhonePersonnel.objects.create(
+                                        contactphone=target_contact_phone,
+                                        personnel=target_personnel,
+                                        extension=cpp.extension
+                                    )
+                        except Exception as e:
+                            logger.error(f"Error copying ContactPhonePersonnel: {e}")
+                            continue
             except Exception as e:
                 logger.error(f"Error copying contact personnel: {e}")
 
@@ -1884,13 +1915,22 @@ class ContactDataCopier:
                     contact=target_contact,
                     user_file=cuf.user_file
                 ).exists():
-                    ContactUserFile.objects.create(
-                        company=self.target_company,
-                        contact=target_contact,
-                        user_file=cuf.user_file,
-                        account=cuf.account or '',
-                        email_msg=cuf.email_msg or ''
-                    )
+                    old_user_file = cuf.user_file
+                    if old_user_file:
+                        user_file = UserFile(company=self.target_company,
+                                    user=self.target_user,
+                                    filename=str(old_user_file.filename),
+                                    filepath=old_user_file.filepath,
+                                    created=timezone.now(),
+                                    updated=timezone.now())
+                        user_file.save()
+                        ContactUserFile.objects.create(
+                            company=self.target_company,
+                            contact=target_contact,
+                            user_file=user_file,
+                            account=cuf.account if cuf.account else None,
+                            email_msg=cuf.email_msg if getattr(cuf, 'email_msg', None) else None
+                        )
             except Exception as e:
                 logger.error(f"Error copying contact user file: {e}")
 
@@ -1933,12 +1973,23 @@ class ContactDataCopier:
             
             self.copy_contacts()
             logger.info("Contact data copy completed successfully!")
-            self._copy_appointments(self.source_company, self.target_company)
-            logger.info("Appointment data copy completed successfully!")
-            self._copy_event_forms(self.source_company, self.target_company)
-            logger.info("Event form data copy completed successfully!")
-            self.copy_user_opportunities()
-            logger.info("Oppotunity copy completed successfully!")
+
+            try:
+                self.copy_user_opportunities()
+                logger.info("Opportunity copy completed successfully!")
+            except Exception as e:
+                error_msg = f"Error copying opportunities: {e}"
+                logger.error(error_msg)
+                self.stats.errors.append(error_msg)
+            
+            try:
+                self.copy_user_followups()
+                logger.info("Followup copy completed successfully!")
+            except Exception as e:
+                error_msg = f"Error copying followups: {e}"
+                logger.error(error_msg)
+                self.stats.errors.append(error_msg)
+                
         except Exception as e:
             error_msg = f"Error during contact copy process: {e}"
             logger.error(error_msg)
@@ -1966,6 +2017,43 @@ class ContactDataCopier:
         except Exception as e:
             logger.error(f"Error copying company custom field configurations: {e}")
     
+    def _copy_info_email(self,source_contact, target_contact):
+        try:
+            for cie in ContactInfoEmail.objects.filter(contact=source_contact):
+                try:
+                    if not ContactInfoEmail.objects.filter(
+                        contact=target_contact,
+                        email=cie.email
+                    ).exists():
+                        ContactInfoEmail.objects.create(
+                            company=self.target_company,
+                            contact=target_contact,
+                            email=cie.email,
+                            created=cie.created or timezone.now(),
+                            updated=cie.updated or timezone.now()
+                        )
+                except Exception as e:
+                    logger.error(f"Error copying ContactInfoEmail: {e}")
+        except Exception as e:
+            logger.error('Error Copying ContactInfoEmail')
+
+    def _copy_contact_regular_fields_states(self):
+        for crfs in ContactRegularFieldsStates.objects.filter(company_id=self.source_company.id):
+            try:
+                if not ContactRegularFieldsStates.objects.filter(
+                    crfield=crfs.crfield,
+                    c_rfield_id=crfs.c_rfield_id,
+                                company_id=self.target_company.id
+                            ).exists():
+                                ContactRegularFieldsStates.objects.create(
+                                    crfield=crfs.crfield,
+                                    c_rfield_id=crfs.c_rfield_id,
+                                    c_state=crfs.c_state,
+                                    company_id=self.target_company.id
+                                )
+            except Exception as e:
+                logger.error(f"Error copying ContactRegularFieldsStates: {e}")
+
     @transaction.atomic
     def copy_user_opportunities(self):
         """Copy opportunities created by the source user"""
@@ -2191,152 +2279,780 @@ class ContactDataCopier:
         logger.info(f"Contact copy service finished at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         logger.info("=" * 80)
 
-    def _copy_appointments(self, source_company, target_company):
+    def _copy_appointments(self, source_company, target_company, source_contact, target_contact):
         self.appointment_index = {}
-        source_appointments = Appointment.objects.filter(company=source_company)
-
+        self.eform_appointment_index = {}
+        source_appointments = Appointment.objects.filter(company=source_company, contact=source_contact)
+        logger.info(f"Found {source_appointments.count()} appointments for contact {source_contact.id}")
         for source_appointment in source_appointments:
             try:
-                target_contact = Contact.objects.get(
-                    id=self.contact_index[source_appointment.contact.id],
-                    company=target_company
-                )
-            except Contact.DoesNotExist:
+                # Check if contact exists in mapping before proceeding
+                if source_appointment.contact.id not in self.contact_index:
+                    logger.debug(f"Skipping appointment {source_appointment.id} - contact {source_appointment.contact.id} not in mapping")
+                    continue
+
+                target_user = self.target_user
+
+                target_event_form = None
+                if source_appointment.event_form:
+                    try:
+                        target_event_form = EventForm.objects.get(
+                            company=target_company,
+                            name=source_appointment.event_form.name
+                        )
+                    except EventForm.DoesNotExist:
+                        logger.debug(f"EventForm {source_appointment.event_form.name} not found in target company")
+
+                try:
+                    new_appointment = Appointment.objects.create(
+                        company=target_company,
+                        user=target_user,
+                        contact=target_contact,
+                        start=source_appointment.start,
+                        stop=source_appointment.stop,
+                        latitude=source_appointment.latitude,
+                        longitude=source_appointment.longitude,
+                        duration=source_appointment.duration,
+                        notes=source_appointment.notes,
+                        title=source_appointment.title,
+                        address=source_appointment.address,
+                        scheduled=source_appointment.scheduled,
+                        item_id=source_appointment.item_id,
+                        html_link=source_appointment.html_link,
+                        event_form=target_event_form,
+                        updated=source_appointment.updated,
+                        created=source_appointment.created,
+                        apt_end_latitude=source_appointment.apt_end_latitude,
+                        apt_end_longitude=source_appointment.apt_end_longitude,
+                        started_with_plus=source_appointment.started_with_plus,
+                        ended_with_plus=source_appointment.ended_with_plus
+                    )
+                    self.appointment_index[source_appointment.id] = new_appointment.id
+                    self.eform_appointment_index[source_appointment.id] = new_appointment.id
+                    self.stats.contact_appointments_copied += 1
+
+                except Exception as e:
+                    logger.error(f"Error copying appointment {source_appointment.id}: {e}")
+                    continue
+
+            except Exception as e:
+                logger.error(f"Error processing appointment {source_appointment.id}: {e}")
                 continue
 
-            target_user = self.target_user
-
-            try:
-                target_event_form = EventForm.objects.get(
-                    company=target_company,
-                    name=source_appointment.event_form.name
-                )
-            except EventForm.DoesNotExist:
-                target_event_form = None
-
-            try:
-                new_appointment = Appointment.objects.create(
-                    company=target_company,
-                    user=target_user,
-                    contact=target_contact,
-                    start=source_appointment.start,
-                    stop=source_appointment.stop,
-                    latitude=source_appointment.latitude,
-                    longitude=source_appointment.longitude,
-                    duration=source_appointment.duration,
-                    notes=source_appointment.notes,
-                    title=source_appointment.title,
-                    address=source_appointment.address,
-                    scheduled=source_appointment.scheduled,
-                    item_id=source_appointment.item_id,
-                    html_link=source_appointment.html_link,
-                    event_form=target_event_form,
-                    updated=source_appointment.updated,
-                    created=source_appointment.created,
-                    apt_end_latitude = source_appointment.apt_end_latitude,
-                    apt_end_longitude = source_appointment.apt_end_longitude,
-                    started_with_plus = source_appointment.started_with_plus,
-                    ended_with_plus = source_appointment.ended_with_plus
-                )
-                self.appointment_index[source_appointment.id] = new_appointment.id
-                self.stats.contact_appointments_copied += 1
-
-            except Exception:
-                logger.error(f"Error copying appointment {source_appointment.id}")
-                pass
-
-    def _copy_event_forms(self, source_company, target_company):
+    def _copy_event_forms(self, source_company, target_company, source_contact, target_contact):
         """Copy Event Forms and related data from source company to target company"""
-        source_contact_event_forms = ContactEventForm.objects.filter(company=source_company)
-
+        source_contact_event_forms = ContactEventForm.objects.filter(company=source_company, contact=source_contact)
+        self.event_form_index = {}
+        logger.info(f"Found {source_contact_event_forms.count()} event forms for contact {source_contact.id}")
         for source_contact_event_form in source_contact_event_forms:
             try:
-                target_contact = Contact.objects.get(
-                    id=self.contact_index[source_contact_event_form.contact.id],
-                    company=target_company
-                )
-            except Contact.DoesNotExist:
-                continue
+                # Check if contact exists in mapping before proceeding
+                if source_contact_event_form.contact.id not in self.contact_index:
+                    logger.error(f"Skipping ContactEventForm {source_contact_event_form.id} - contact {source_contact_event_form.contact.id} not in mapping")
+                    continue
 
-            target_user = self.target_user
+                target_user = self.target_user
 
-            # Get or create target EventForm
-            try:
-                target_event_form = EventForm.objects.filter(
-                    name=source_contact_event_form.event_form.name,
-                    company=target_company
-                ).first()
-            except EventForm.DoesNotExist:
+                # Get or create target EventForm
                 target_event_form = None
-
-            if not target_event_form:
                 try:
-                    original_event_form = source_contact_event_form.event_form
-                    target_event_form = EventForm.objects.create(
-                        company=target_company,
-                        name=original_event_form.name,
-                        position=original_event_form.position,
-                        post_back_url=original_event_form.post_back_url,
-                        post_back_secret=original_event_form.post_back_secret,
-                        points=original_event_form.points,
-                        is_schedule_followup=original_event_form.is_schedule_followup,
-                        send_email_to_rep=original_event_form.send_email_to_rep,
-                        event_form_treat_as=original_event_form.event_form_treat_as,
-                        prefill_data=original_event_form.prefill_data,
-                        is_after_call_form=original_event_form.is_after_call_form,
-                        hide=original_event_form.hide,
-                    )
-                    self.stats.event_forms_copied += 1
+                    target_event_form = EventForm.objects.filter(
+                        name=source_contact_event_form.event_form.name,
+                        company=target_company
+                    ).first()
+                except Exception as e:
+                    logger.error(f"Error looking up EventForm: {e}")
 
-                    # Copy EventFormCFields using CustomFieldHandler
-                    self.custom_field_handler.copy_event_form_cfields(
-                        source_contact_event_form.event_form, 
-                        target_event_form
-                    )
-                    
-                    # Debug the field mapping if there are issues
-                    if logger.level <= logging.DEBUG:
-                        self.custom_field_handler.debug_event_form_field_mapping(
+                if not target_event_form:
+                    try:
+                        original_event_form = source_contact_event_form.event_form
+                        target_event_form = EventForm.objects.create(
+                            company=target_company,
+                            name=original_event_form.name,
+                            position=original_event_form.position,
+                            post_back_url=original_event_form.post_back_url,
+                            post_back_secret=original_event_form.post_back_secret,
+                            points=original_event_form.points,
+                            is_schedule_followup=original_event_form.is_schedule_followup,
+                            send_email_to_rep=original_event_form.send_email_to_rep,
+                            event_form_treat_as=original_event_form.event_form_treat_as,
+                            prefill_data=original_event_form.prefill_data,
+                            is_after_call_form=original_event_form.is_after_call_form,
+                            hide=original_event_form.hide,
+                            post_back_method=original_event_form.post_back_method,
+                            is_clickable=original_event_form.is_clickable
+                        )
+                        self.stats.event_forms_copied += 1
+
+                        # Copy EventFormCFields using CustomFieldHandler
+                        self.custom_field_handler.copy_event_form_cfields(
                             source_contact_event_form.event_form, 
                             target_event_form
                         )
-                except Exception as e:
-                    logger.error(f"Error copying EventForm: {e}")
-                    continue
+                        
+                        # Debug the field mapping if there are issues
+                        if logger.level <= logging.DEBUG:
+                            self.custom_field_handler.debug_event_form_field_mapping(
+                                source_contact_event_form.event_form, 
+                                target_event_form
+                            )
+                    except Exception as e:
+                        logger.error(f"Error copying EventForm: {e}")
+                        continue
 
-            # Copy ContactEventForm
-            try:
-                target_contact_event_form = ContactEventForm(
-                    company=target_company,
-                    user=target_user,
-                    contact=target_contact,
-                    event_form=target_event_form,
-                    created=source_contact_event_form.created,
-                    points=source_contact_event_form.points,
-                    latitude=source_contact_event_form.latitude,
-                    longitude=source_contact_event_form.longitude,
-                    completed=source_contact_event_form.completed,
-                    completed_date=source_contact_event_form.completed_date,
-                )
-                if source_contact_event_form.appointment:
-                    target_contact_event_form.appointment_id = self.appointment_index.get(
-                        source_contact_event_form.appointment.id
+                self.event_form_index[source_contact_event_form.event_form.id] = target_event_form.id
+                # Handle source event form appointment mapping
+                eform_appointment = Appointment.objects.filter(
+                    event_form=source_contact_event_form.event_form, 
+                    company=source_company
+                ).first()
+                
+                if eform_appointment and eform_appointment.id in self.appointment_index:
+                    target_appointment_id = self.appointment_index.get(eform_appointment.id)
+                    if target_appointment_id:
+                        try:
+                            target_appointment = Appointment.objects.get(pk=target_appointment_id)
+                            target_appointment.event_form = target_event_form
+                            target_appointment.save(update_fields=['event_form_id'])
+                            logger.info('Mapped event form appointment with new appointment')
+                        except Appointment.DoesNotExist:
+                            logger.warning(f'Target appointment {target_appointment_id} not found, skipping event form mapping')
+                        except Exception as e:
+                            logger.error(f'Error mapping event form appointment: {e}')
+
+                # Copy ContactEventForm
+                try:
+                    target_contact_event_form = ContactEventForm(
+                        company=target_company,
+                        user=target_user,
+                        contact=target_contact,
+                        event_form=target_event_form,
+                        created=source_contact_event_form.created,
+                        points=source_contact_event_form.points,
+                        latitude=source_contact_event_form.latitude,
+                        longitude=source_contact_event_form.longitude,
+                        completed=source_contact_event_form.completed,
+                        completed_date=source_contact_event_form.completed_date,
                     )
-                target_contact_event_form.save()
-                self.stats.contact_event_forms_copied += 1
+                    
+                    # Handle appointment mapping for ContactEventForm
+                    if source_contact_event_form.appointment:
+                        target_appointment_id = self.appointment_index.get(source_contact_event_form.appointment.id)
+                        if target_appointment_id:
+                            target_contact_event_form.appointment_id = target_appointment_id
+                    
+                    target_contact_event_form.save()
+                    self.stats.contact_event_forms_copied += 1
+                    
+                    # Copy ContactEventFormPersonnel
+                    try:
+                        for cefp in ContactEventFormPersonnel.objects.filter(contacteventform=source_contact_event_form):
+                            try:
+                                if not cefp.personnel:
+                                    continue
+                                    
+                                # Map personnel to target by first/last name on target contact
+                                target_personnel = ContactPersonnel.objects.filter(
+                                    contact=target_contact,
+                                    first_name=cefp.personnel.first_name,
+                                    last_name=cefp.personnel.last_name,
+                                ).first()
+                                
+                                if target_personnel and not ContactEventFormPersonnel.objects.filter(
+                                    contacteventform=target_contact_event_form,
+                                    personnel=target_personnel
+                                ).exists():
+                                    ContactEventFormPersonnel.objects.create(
+                                        contacteventform=target_contact_event_form,
+                                        personnel=target_personnel,
+                                    )
+                                    logger.info('Copied ContactEventFormPersonnel data')
+                            except Exception as e:
+                                logger.error(f"Error copying ContactEventFormPersonnel: {e}")
+                                
+                    except Exception as e:
+                        logger.error(f"Error copying ContactEventFormPersonnel records: {e}")
+                    
+                    # Additional appointment mapping check
+                    if (
+                        source_contact_event_form.appointment is not None and
+                        getattr(source_contact_event_form.appointment, "id", None) is not None and
+                        source_contact_event_form.appointment.id in self.eform_appointment_index
+                    ):
+                        try:
+                            target_contact_event_form.appointment.id = self.eform_appointment_index[source_contact_event_form.appointment.id]
+                            target_contact_event_form.save(update_fields=['appointment_id'])
+                            logger.info('Mapped eform appointment with new appointment')
+                        except Exception as e:
+                            logger.error(f'Error mapping eform appointment: {e}')
+                            logger.exception(e)
+
+                    # Copy CFieldValue and CFieldMultiValue entries using CustomFieldService
+                    try:
+                        self.custom_field_handler.copy_custom_fields_using_service(
+                            source_contact_event_form.id,
+                            target_contact_event_form.id,
+                            'eventform',  # Use 'eventform' as expected by CustomFieldService
+                            source_entity=source_contact_event_form,
+                            target_entity=target_contact_event_form
+                        )
+                    except Exception as e:
+                        logger.error(f"Error copying custom fields for ContactEventForm {source_contact_event_form.id}: {e}")
+                        
+                except Exception as e:
+                    logger.error(f"Error copying ContactEventForm {source_contact_event_form.id}: {e}")
+                    continue
+                    
             except Exception as e:
-                logger.error(f"Error copying ContactEventForm: {e}")
+                logger.error(f"Error processing ContactEventForm {source_contact_event_form.id}: {e}")
                 continue
+        try:
+            self._copy_event_form_contact_types()
+        except Exception as e:
+            logger.error(f"Error in _copy_event_form_contact_types: {e}")
 
-            # Copy CFieldValue and CFieldMultiValue entries using CustomFieldService
-            self.custom_field_handler.copy_custom_fields_using_service(
-                source_contact_event_form.id,
-                target_contact_event_form.id,
-                'eventform',  # Use 'eventform' as expected by CustomFieldService
-                source_entity=source_contact_event_form,
-                target_entity=target_contact_event_form
-            )
+        try:
+            self._copy_event_form_contact_types()
+        except Exception as e:
+            logger.error(f"Error in _copy_event_form_contact_types (second call): {e}")
 
+        try:
+            self._copy_event_form_emails()
+        except Exception as e:
+            logger.error(f"Error in _copy_event_form_emails: {e}")
+
+        try:
+            self._copy_report_fields()
+        except Exception as e:
+            logger.error(f"Error in _copy_report_fields: {e}")
+
+        try:
+            self._copy_report_field_group_by()
+        except Exception as e:
+            logger.error(f"Error in _copy_report_field_group_by: {e}")
+
+    def _copy_event_form_emails(self):
+        """Copy EventFormEMail notification settings"""
+        try:
+            if not hasattr(self, 'event_form_index'):
+                logger.error("Event form index not found, skipping email copy")
+                return
+                
+            for source_form_id, target_form_id in self.event_form_index.items():
+                source_emails = EventFormEMail.objects.filter(event_form_id=source_form_id)
+                target_form = EventForm.objects.get(id=target_form_id)
+                
+                for efe in source_emails:
+                    try:
+                        # Check if email already exists
+                        existing_email = EventFormEMail.objects.filter(
+                            event_form=target_form,
+                            email=efe.email
+                        ).first()
+                        
+                        if not existing_email:
+                            EventFormEMail.objects.create(
+                                event_form=target_form,
+                                email=efe.email
+                            )
+                            logger.info(f"Created EventFormEMail: {efe.email}")
+                            
+                    except Exception as e:
+                        logger.error(f"Error copying EventFormEMail: {e}")
+                        
+        except Exception as e:
+            logger.error(f"Error copying EventForm emails: {e}")
+
+    def _copy_report_fields(self):
+        """Copy ReportField records"""
+        try:
+            if not hasattr(self, 'event_form_index'):
+                logger.error("Event form index not found, skipping email copy")
+                return
+                
+            source_report_fields = ReportField.objects.filter(company=self.source_company)
+            for report_field in source_report_fields:
+                try:
+                    # Map EventForm FK
+                    target_event_form_id = self.event_form_index.get(report_field.event_form.id)
+                    if target_event_form_id:
+                        target_event_form = EventForm.objects.get(id=target_event_form_id)
+                        
+                        # Map EventFormCField FK if exists
+                        target_event_form_cfield = None
+                        if report_field.event_form_cfield:
+                            target_event_form_cfield = EventFormCField.objects.filter(
+                                event_form=target_event_form,
+                                cfield__name=report_field.event_form_cfield.cfield.name
+                            ).first()
+                        
+                        # Check if ReportField already exists
+                        existing_report_field = ReportField.objects.filter(
+                            company=self.target_company,
+                            event_form=target_event_form,
+                            position=report_field.position
+                        ).first()
+                        
+                        if not existing_report_field:
+                            ReportField.objects.create(
+                                company=self.target_company,
+                                report=report_field.report, 
+                                event_form=target_event_form,
+                                event_form_cfield=target_event_form_cfield,
+                                count_entries=report_field.count_entries,
+                                report_field_action=report_field.report_field_action,
+                                group_by=report_field.group_by,
+                                position=report_field.position
+                            )
+                            logger.info(f"Created ReportField for {target_event_form.name}")
+                except Exception as e:
+                    logger.error(f"Error copying ReportField: {e}")
+        except Exception as e:
+            logger.error(f"Error copying ReportFields: {e}")
+
+    def _copy_report_field_group_by(self):
+        """Copy ReportFieldGroupBy records"""
+        try:
+            source_group_bys = ReportFieldGroupBy.objects.filter(company=self.source_company)
+            for group_by in source_group_bys:
+                try:
+                    # Find target ReportField by matching event_form and position
+                    target_report_field = ReportField.objects.filter(
+                        company=self.target_company,
+                        event_form__name=group_by.report_field.event_form.name,
+                        position=group_by.report_field.position
+                    ).first()
+                    
+                    if target_report_field:
+                        # Find target CFieldOption by name
+                        target_cfield_option = CFieldOption.objects.filter(
+                            cfield__company=self.target_company,
+                            cfield__name=group_by.cfield_option.cfield.name,
+                            name=group_by.cfield_option.name
+                        ).first()
+                        
+                        if target_cfield_option:
+                            # Check if ReportFieldGroupBy already exists
+                            existing_group_by = ReportFieldGroupBy.objects.filter(
+                                company=self.target_company,
+                                report_field=target_report_field,
+                                cfield_option=target_cfield_option
+                            ).first()
+                            
+                            if not existing_group_by:
+                                ReportFieldGroupBy.objects.create(
+                                    company=self.target_company,
+                                    report_field=target_report_field,
+                                    cfield_option=target_cfield_option
+                                )
+                                logger.info(f"Created ReportFieldGroupBy")
+                                
+                except Exception as e:
+                    logger.error(f"Error copying ReportFieldGroupBy: {e}")
+                    
+        except Exception as e:
+            logger.error(f"Error copying ReportFieldGroupBys: {e}")
+
+    def _copy_event_form_contact_types(self):
+        """Copy EventFormContactType associations"""
+        try:
+            if not hasattr(self, 'event_form_index'):
+                logger.error("Event form index not found, skipping email copy")
+                return
+                
+            for source_form_id, target_form_id in self.event_form_index.items():
+                source_contact_types = EventFormContactType.objects.filter(event_form_id=source_form_id)
+                target_form = EventForm.objects.get(id=target_form_id)
+                
+                for efct in source_contact_types:
+                    try:
+                        # Find equivalent contact type in target company
+                        target_contact_type = ContactType.objects.filter(
+                            company=self.target_company,
+                            name=efct.contact_type.name
+                        ).first()
+                        
+                        if target_contact_type:
+                            # Check if association already exists
+                            existing_assoc = EventFormContactType.objects.filter(
+                                company=self.target_company,
+                                event_form=target_form,
+                                contact_type=target_contact_type
+                            ).first()
+                            
+                            if not existing_assoc:
+                                EventFormContactType.objects.create(
+                                    company=self.target_company,
+                                    event_form=target_form,
+                                    contact_type=target_contact_type
+                                )
+                                logger.info("Created EventFormContactType association")
+                                
+                    except Exception as e:
+                        logger.error(f"Error copying EventFormContactType: {e}")
+                        
+        except Exception as e:
+            logger.error(f"Error copying EventForm contact types: {e}")
+
+    @transaction.atomic
+    def copy_user_followups(self):
+        """Copy followup data for the user's contacts"""
+        logger.info(f"[{datetime.now()}] Copying followups for user {self.source_user.id} -> {self.target_user.id}")
+        
+        # First copy company-level followup configuration
+        self._copy_followup_configuration()
+        
+        # Get followups for contacts that were copied
+        copied_contact_ids = list(self.contact_index.keys())
+        
+        if not copied_contact_ids:
+            logger.info("No contacts copied, skipping followups")
+            return
+        
+        user_followups = Followup.objects.filter(
+            user=self.source_user,
+            contact_id__in=copied_contact_ids
+        ).select_related('followup_type', 'stage', 'priority', 'appointment', 'contacteventform', 'contact_phone', 'calendar_event')
+        
+        logger.info(f"Found {user_followups.count()} followups for user {self.source_user.id}")
+        
+        for followup in user_followups:
+            try:
+                target_contact_id = self.contact_index.get(followup.contact_id)
+                if not target_contact_id:
+                    logger.warning(f"Skipping Followup {followup.id} - contact {followup.contact_id} not found in mapping (required FK)")
+                    continue
+                
+                target_contact = Contact.objects.get(pk=target_contact_id)
+                
+                # Map related objects
+                target_appointment = None
+                if followup.appointment:
+                    target_appointment_id = self.appointment_index.get(followup.appointment.id)
+                    if target_appointment_id:
+                        target_appointment = Appointment.objects.get(pk=target_appointment_id)
+                
+                target_contact_event_form = None
+                if followup.contacteventform:
+                    target_contact_event_form = ContactEventForm.objects.filter(
+                        company=self.target_company,
+                        contact=target_contact,
+                        event_form__name=followup.contacteventform.event_form.name
+                    ).first()
+                
+                target_contact_phone = None
+                if followup.contact_phone:
+                    target_contact_phone = ContactPhone.objects.filter(
+                        contact=target_contact,
+                        phone_number=followup.contact_phone.phone_number
+                    ).first()
+                
+                # Map followup configuration
+                target_followup_type = None
+                if followup.followup_type:
+                    target_followup_type = FollowupType.objects.filter(
+                        company=self.target_company,
+                        name=followup.followup_type.name
+                    ).first()
+                    if not target_followup_type:
+                        #create new followup type if not exists
+                        target_followup_type = FollowupType.objects.create(
+                            company=self.target_company,
+                            name=followup.followup_type.name,
+                            position=followup.followup_type.position,
+                            is_default=followup.followup_type.is_default
+                        )                       
+
+                target_stage = None
+                if followup.stage:
+                    target_stage = FollowupStage.objects.filter(
+                        company=self.target_company,
+                        name=followup.stage.name
+                    ).first()
+                    if not target_stage:
+                        # create new followup stage if not exists
+                        target_stage = FollowupStage.objects.create(
+                            company=self.target_company,
+                            name=followup.stage.name,
+                            fg_color=followup.stage.fg_color,
+                            bg_color=followup.stage.bg_color,
+                            position=followup.stage.position,
+                            map_with_not_completed=followup.stage.map_with_not_completed,
+                            map_with_completed=followup.stage.map_with_completed,
+                            created=followup.stage.created or timezone.now(),
+                            updated=followup.stage.updated or timezone.now()
+                        )
+                
+                target_priority = None
+                if followup.priority:
+                    target_priority = FollowupPriority.objects.filter(
+                        name=followup.priority.name
+                    ).first()
+                
+                # CalendarEventFollowups: create or link equivalent
+                target_calendar_event = None
+                if followup.calendar_event:
+                    cef = followup.calendar_event
+                    target_calendar_event = CalendarEventFollowups.objects.filter(
+                        event_type=cef.event_type,
+                        range_type=cef.range_type,
+                        number_of_occurrences=cef.number_of_occurrences,
+                        days_of_week=cef.days_of_week,
+                        days_of_month=cef.days_of_month,
+                        interval=cef.interval,
+                        index=cef.index,
+                        start_date=cef.start_date,
+                        end_date=cef.end_date,
+                        month=cef.month
+                    ).first()
+                    if not target_calendar_event:
+                        target_calendar_event = CalendarEventFollowups.objects.create(
+                            event_type=cef.event_type,
+                            range_type=cef.range_type,
+                            number_of_occurrences=cef.number_of_occurrences,
+                            days_of_week=cef.days_of_week,
+                            days_of_month=cef.days_of_month,
+                            interval=cef.interval,
+                            index=cef.index,
+                            start_date=cef.start_date,
+                            end_date=cef.end_date,
+                            month=cef.month,
+                            created=cef.created or timezone.now(),
+                            updated=cef.updated or timezone.now()
+                        )
+                        self.stats.calendar_event_followups_copied += 1
+                        logger.info(f'CalendarEventFollowups Table copied for {CalendarEventFollowups}')
+                
+                # Check if followup already exists
+                existing_followup = Followup.objects.filter(
+                    user=self.target_user,
+                    contact=target_contact,
+                    start=followup.start,
+                    notes=followup.notes
+                ).first()
+                
+                if existing_followup:
+                    continue
+                
+                new_followup = Followup.objects.create(
+                    user=self.target_user,
+                    contact=target_contact,
+                    start=followup.start,
+                    appointment=target_appointment,
+                    contacteventform=target_contact_event_form,
+                    duration=followup.duration,
+                    notes=followup.notes,
+                    completed=followup.completed,
+                    contact_phone=target_contact_phone,
+                    send_google_cal=followup.send_google_cal,
+                    send_office_cal=followup.send_office_cal,
+                    item_id=followup.item_id,
+                    html_link=followup.html_link,
+                    office_item_id=followup.office_item_id,
+                    office_html_link=followup.office_html_link,
+                    updated=followup.updated or timezone.now(),
+                    created=followup.created or timezone.now(),
+                    followup_type=target_followup_type,
+                    stage=target_stage,
+                    priority=target_priority,
+                    calendar_event=target_calendar_event
+                )
+                logger.info(f'Follow up data Copied for {self.target_user} - Contact{target_contact}')
+                
+                # Copy followup call data if exists
+                self._copy_followup_call_data(followup, new_followup)
+                
+                # Copy followup personnel if exists
+                self._copy_followup_personnel_data(followup, new_followup,target_contact)
+                
+                self.stats.followups_copied += 1
+                
+            except Exception as e:
+                error_msg = f"Error creating followup {followup.id}: {e}"
+                logger.error(error_msg)
+                self.stats.errors.append(error_msg)
+                continue
+        
+        logger.info(f"[{datetime.now()}] Followups copied: {self.stats.followups_copied}")
+    
+    def _copy_followup_configuration(self):
+        """Copy company-level followup configuration tables"""
+        logger.info("Copying followup configuration...")
+        
+        # Copy FollowupType
+        try:
+            for ft in FollowupType.objects.filter(company=self.source_company):
+                if not FollowupType.objects.filter(company=self.target_company, name=ft.name).exists():
+                    FollowupType.objects.create(
+                        company=self.target_company,
+                        name=ft.name,
+                        position=ft.position,
+                        is_default=ft.is_default
+                    )
+                    self.stats.followup_types_copied += 1
+        except Exception as e:
+            logger.error(f"Error copying FollowupType: {e}")
+        
+        # Copy FollowupStage
+        try:
+            for fs in FollowupStage.objects.filter(company=self.source_company):
+                if not FollowupStage.objects.filter(company=self.target_company, name=fs.name).exists():
+                    FollowupStage.objects.create(
+                        company=self.target_company,
+                        name=fs.name,
+                        fg_color=fs.fg_color,
+                        bg_color=fs.bg_color,
+                        position=fs.position,
+                        map_with_not_completed=fs.map_with_not_completed,
+                        map_with_completed=fs.map_with_completed,
+                        created=fs.created or timezone.now(),
+                        updated=fs.updated or timezone.now()
+                    )
+                    self.stats.followup_stages_copied += 1
+                    logger.info('Create FollowupStage table for {self.target_company} User {fs.name}')
+        except Exception as e:
+            logger.error(f"Error copying FollowupStage: {e}")
+        
+        # Copy FollowupPriority (global table)
+        try:
+            for fp in FollowupPriority.objects.all():
+                if not FollowupPriority.objects.filter(name=fp.name).exists():
+                    FollowupPriority.objects.create(
+                        name=fp.name,
+                        created=fp.created or timezone.now(),
+                        updated=fp.updated or timezone.now()
+                    )
+                    self.stats.followup_priorities_copied += 1
+                    logger.ingo('FollowupPriority table data copied')
+        except Exception as e:
+            logger.error(f"Error copying FollowupPriority: {e}")
+    
+    def _copy_followup_call_data(self, original_followup, target_followup):
+        """Copy FollowupCall data for a followup"""
+        try:
+            followup_calls = FollowupCall.objects.filter(followup=original_followup)
+            for fc in followup_calls:
+                try:
+                    # Map store
+                    target_store = None
+                    if fc.store:
+                        target_store = DealerStore.objects.filter(
+                            company=self.target_company,
+                            name=fc.store.name
+                        ).first()
+                    
+                    # Map contact phone
+                    target_contact_phone = None
+                    if fc.contact_phone:
+                        target_contact_phone = ContactPhone.objects.filter(
+                            contact=target_followup.contact,
+                            phone_number=fc.contact_phone.phone_number
+                        ).first()
+                    
+                    # Map call if exists
+                    target_call = None
+                    if fc.call:
+                        target_call_id = self.call_index.get(fc.call.id)
+                        if target_call_id:
+                            target_call = Call.objects.get(pk=target_call_id)
+                    
+                    # Check if already exists
+                    if not FollowupCall.objects.filter(
+                        company=self.target_company,
+                        followup=target_followup,
+                        user=self.target_user,
+                        contact=target_followup.contact,
+                        contact_phone=target_contact_phone
+                    ).exists():
+                        FollowupCall.objects.create(
+                            company=self.target_company,
+                            followup=target_followup,
+                            user=self.target_user,
+                            store=target_store,
+                            contact=target_followup.contact,
+                            contact_phone=target_contact_phone,
+                            call=target_call,
+                            response_time=fc.response_time,
+                            new_upgrade=fc.new_upgrade,
+                            upgrade_time=fc.upgrade_time,
+                            created=fc.created or timezone.now(),
+                            is_followup_call=fc.is_followup_call
+                        )
+                        self.stats.followup_calls_copied += 1
+                        logger.info('FollowupCall tabled data copied ')
+                        
+                except Exception as e:
+                    logger.error(f"Error copying FollowupCall {fc.id}: {e}")
+                    continue
+                    
+        except Exception as e:
+            logger.error(f"Error copying FollowupCall data: {e}")
+    
+    def _copy_followup_personnel_data(self, original_followup, target_followup, target_contact):
+        """Copy FollowupPersonnel data for a followup"""
+        try:
+            followup_personnels = FollowupPersonnel.objects.filter(followup=original_followup)
+            for fp in followup_personnels:
+                try:
+                    # Find equivalent ContactPersonnel in target company
+                    original_personnel = fp.personnel
+                    target_personnel = None
+                    
+
+                    # Try to find matching personnel by email in target company
+                    if original_personnel.email:
+                        target_personnel = ContactPersonnel.objects.filter(
+                            company=self.target_company,
+                            email=original_personnel.email
+                        ).first()
+                        
+
+                    # If not found by email, try by name
+                    if not target_personnel:
+                        target_personnel = ContactPersonnel.objects.filter(
+                            company=self.target_company,
+                            first_name=original_personnel.first_name,
+                            contact=target_contact,
+                            last_name=original_personnel.last_name
+                        ).first()
+
+                        
+
+                    # If still not found, create new personnel in target company
+                    if not target_personnel:
+                        target_personnel = ContactPersonnel.objects.create(
+                            company=self.target_company,
+                            contact=target_contact,
+                            first_name=original_personnel.first_name,
+                            last_name=original_personnel.last_name,
+                            email=original_personnel.email,
+                            title=original_personnel.title,
+                            created_by=self.target_user,
+                            updated_by=self.target_user,
+                            created=original_personnel.created or timezone.now(),
+                            updated=original_personnel.updated or timezone.now()
+                        )
+                        logger.info(f"Created new ContactPersonnel: {target_personnel.first_name} {target_personnel.last_name}")
+                    
+                    # Check if FollowupPersonnel already exists
+                    if not FollowupPersonnel.objects.filter(
+                        followup=target_followup,
+                        personnel=target_personnel
+                    ).exists():
+                        FollowupPersonnel.objects.create(
+                            followup=target_followup,
+                            personnel=target_personnel
+                        )
+                        self.stats.followup_personnels_copied += 1
+                        logger.info(f"Copied FollowupPersonnel for {target_personnel.first_name} {target_personnel.last_name}")
+                        
+                except Exception as e:
+                    logger.error(f"Error copying FollowupPersonnel {fp.id}: {e}")
+                    continue
+                    
+        except Exception as e:
+            logger.error(f"Error copying FollowupPersonnel data: {e}")
+    
 def parse_arguments() -> Tuple[int, int]:
     """Parse and validate command line arguments"""
     parser = argparse.ArgumentParser(description='Copy contact data between users')
@@ -2393,7 +3109,7 @@ def main():
     
     try:
         source_user_id = 19934
-        target_user_id = 19950
+        target_user_id = 19962
 
         # Create copier and execute
         copier = ContactDataCopier(source_user_id, target_user_id)
