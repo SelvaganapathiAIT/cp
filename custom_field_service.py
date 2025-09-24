@@ -53,7 +53,7 @@ class CustomFieldService:
         self.errors = {}
 
         # Regular expressions for integers and decimals
-        self.number_regex = re.compile('[^0-9\.]')
+        self.number_regex = re.compile(r'[^0-9\.]')
 
     @property
     def sourcetype(self):
