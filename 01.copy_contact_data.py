@@ -255,6 +255,48 @@ class CustomFieldHandler:
         except Exception as e:
             self.logger.error(f"Error copying CField options: {e}")
 
+    def get_or_create_cfield_option(self, source_option, target_cfield):
+        """
+        Get or create a CFieldOption in the target company based on a source option
+        
+        Args:
+            source_option: The source CFieldOption to copy
+            target_cfield: The target CField to create the option for
+            
+        Returns:
+            The target CFieldOption instance, or None if creation failed
+        """
+        try:
+            # Check if option already exists by name
+            existing_option = CFieldOption.objects.filter(
+                cfield=target_cfield,
+                name=source_option.name
+            ).first()
+            
+            if existing_option:
+                # Update the option index mapping
+                self.cfield_option_index[source_option.id] = existing_option.id
+                return existing_option
+            
+            # Create new option
+            target_option = CFieldOption.objects.create(
+                cfield=target_cfield,
+                name=source_option.name,
+                position=source_option.position or 0,
+                points=source_option.points or 0
+            )
+            
+            # Update mappings and stats
+            self.cfield_option_index[source_option.id] = target_option.id
+            self.stats['custom_field_options_copied'] += 1
+            self.logger.debug(f"Created CFieldOption: {target_option.name} for field {target_cfield.name}")
+            
+            return target_option
+            
+        except Exception as e:
+            self.logger.error(f"Error creating CFieldOption {source_option.name}: {e}")
+            return None
+
     def copy_cfield_values(self, source_entity_id, target_entity_id, table_name, source_cfields=None):
         """
         Copy CFieldValue records for a specific entity
@@ -354,21 +396,8 @@ class CustomFieldHandler:
                         self.logger.warning(f"Could not create target cfield for {source_multi_value.cfield.name}")
                         continue
 
-                    # Get or create target option - ensure we're mapping the option correctly
-                    target_option = CFieldOption.objects.filter(
-                        cfield=target_cfield,
-                        name=source_multi_value.option.name
-                    ).first()
-
-                    if not target_option:
-                        target_option = CFieldOption.objects.create(
-                            cfield=target_cfield,
-                            name=source_multi_value.option.name,
-                            position=source_multi_value.option.position or 0,
-                            points=source_multi_value.option.points or 0
-                        )
-                        self.stats['custom_field_options_copied'] += 1
-                        self.logger.debug(f"Created CFieldOption: {target_option.name} for field {target_cfield.name}")
+                    # Get or create target option using centralized method
+                    target_option = self.get_or_create_cfield_option(source_multi_value.option, target_cfield)
 
                     # Check if multi-value already exists
                     if not CFieldMultiValue.objects.filter(
@@ -655,20 +684,8 @@ class CustomFieldHandler:
             )
             
             for source_multi_value in source_multi_values:
-                # Get or create target option
-                target_option = CFieldOption.objects.filter(
-                    cfield=target_cfield,
-                    name=source_multi_value.option.name
-                ).first()
-                
-                if not target_option:
-                    target_option = CFieldOption.objects.create(
-                        cfield=target_cfield,
-                        name=source_multi_value.option.name,
-                        position=source_multi_value.option.position or 0,
-                        points=source_multi_value.option.points or 0
-                    )
-                    self.stats['custom_field_options_copied'] += 1
+                # Get or create target option using centralized method
+                target_option = self.get_or_create_cfield_option(source_multi_value.option, target_cfield)
                 
                 # Create multi-value entry
                 if not CFieldMultiValue.objects.filter(
