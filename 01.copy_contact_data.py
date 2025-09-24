@@ -63,6 +63,9 @@ from cp.models import (
     OppContact, OppPersonnel, OppHistory, OppFormCField
 )
 
+# Import the CustomFieldService for proper custom field handling
+from custom_field_service import CustomFieldService
+
 
 @dataclass
 class ContactStats:
@@ -728,6 +731,203 @@ class CustomFieldHandler:
     def get_stats(self):
         """Return statistics about custom field copying"""
         return self.stats.copy()
+    
+    def copy_custom_fields_using_service(self, source_entity_id, target_entity_id, table_name, source_entity=None, target_entity=None):
+        """
+        Copy custom field values using the CustomFieldService for proper handling of all field types.
+        This method leverages the business logic in CustomFieldService to ensure proper field processing.
+        
+        Args:
+            source_entity_id: ID of the source entity
+            target_entity_id: ID of the target entity  
+            table_name: Name of the CFieldTable (e.g., 'contact', 'eventform', 'opp')
+            source_entity: Optional source entity object (Contact, ContactEventForm, Opp)
+            target_entity: Optional target entity object (Contact, ContactEventForm, Opp)
+        """
+        try:
+            self.logger.info(f"Copying custom fields using CustomFieldService for {table_name} entity {source_entity_id} -> {target_entity_id}")
+            
+            # Get all custom field values for the source entity
+            source_cfield_values = CFieldValue.objects.filter(
+                entity_id=source_entity_id,
+                cfield__company=self.source_company
+            ).select_related('cfield', 'cfield__cfield_type', 'cfield__cfield_table')
+            
+            # Get all custom field multi-values for the source entity
+            source_cfield_multi_values = CFieldMultiValue.objects.filter(
+                entity_id=source_entity_id,
+                cfield__company=self.source_company
+            ).select_related('cfield', 'cfield__cfield_type', 'cfield__cfield_table', 'option')
+            
+            if not source_cfield_values.exists() and not source_cfield_multi_values.exists():
+                self.logger.debug(f"No custom field data found for {table_name} entity {source_entity_id}")
+                return
+                
+            self.logger.info(f"Found {source_cfield_values.count()} CFieldValues and {source_cfield_multi_values.count()} CFieldMultiValues to copy")
+            
+            # Prepare POST data dictionary to simulate form submission
+            post_data = {'entity': str(target_entity_id), 'user': self.target_user}
+            
+            # Process CFieldValue records
+            for source_value in source_cfield_values:
+                try:
+                    # Get or create the corresponding target custom field
+                    source_table_name = source_value.cfield.cfield_table.name if source_value.cfield.cfield_table else table_name
+                    target_cfield = self.get_or_create_cfield(source_value.cfield, source_table_name)
+                    if not target_cfield:
+                        continue
+                    
+                    # Handle different field types appropriately
+                    field_key = f'cf_{target_cfield.id}'
+                    field_value = source_value.cf_value
+                    
+                    # Handle different field types with proper value mapping
+                    if target_cfield.cfield_type:
+                        field_type_name = target_cfield.cfield_type.name
+                        
+                        # For select/radio fields that store option IDs, we need to map to target option IDs
+                        if (field_type_name in ['select', 'radio'] and 
+                            field_value and str(field_value).isdigit()):
+                            try:
+                                source_option_id = int(field_value)
+                                source_option = CFieldOption.objects.filter(
+                                    cfield=source_value.cfield, 
+                                    id=source_option_id
+                                ).first()
+                                if source_option:
+                                    target_option = self.get_or_create_cfield_option(source_option, target_cfield)
+                                    if target_option:
+                                        field_value = str(target_option.id)
+                                        self.logger.debug(f"Mapped option {source_option.name} from ID {source_option_id} to {target_option.id}")
+                            except (ValueError, TypeError):
+                                pass  # Keep original value if not a valid option ID
+                        
+                        # For checkbox fields, ensure proper boolean handling
+                        elif field_type_name == 'checkbox':
+                            if field_value in ['1', 'true', 'True', True, 1]:
+                                field_value = '1'
+                            else:
+                                field_value = '0'
+                        
+                        # For date/datetime fields, preserve the format
+                        elif field_type_name in ['date', 'datetime', 'time']:
+                            # The CustomFieldService will handle parsing, just pass through
+                            pass
+                    
+                    post_data[field_key] = field_value
+                    self.logger.debug(f"Added field {target_cfield.name} (cf_{target_cfield.id}) = {field_value}")
+                    
+                except Exception as e:
+                    self.logger.error(f"Error processing CFieldValue {source_value.id}: {e}")
+                    continue
+            
+            # Process CFieldMultiValue records (for multi-select fields)
+            multi_value_fields = {}
+            for source_multi_value in source_cfield_multi_values:
+                try:
+                    # Get or create the corresponding target custom field
+                    source_table_name = source_multi_value.cfield.cfield_table.name if source_multi_value.cfield.cfield_table else table_name
+                    target_cfield = self.get_or_create_cfield(source_multi_value.cfield, source_table_name)
+                    if not target_cfield:
+                        continue
+                        
+                    # Get or create the corresponding target option
+                    target_option = self.get_or_create_cfield_option(source_multi_value.option, target_cfield)
+                    if not target_option:
+                        continue
+                    
+                    # Collect multi-value field options
+                    field_key = f'cf_{target_cfield.id}'
+                    if field_key not in multi_value_fields:
+                        multi_value_fields[field_key] = []
+                    multi_value_fields[field_key].append(str(target_option.id))
+                    
+                    self.logger.debug(f"Added multi-value for field {target_cfield.name} (cf_{target_cfield.id}) = option {target_option.name}")
+                    
+                except Exception as e:
+                    self.logger.error(f"Error processing CFieldMultiValue {source_multi_value.id}: {e}")
+                    continue
+            
+            # Add multi-value fields to POST data
+            for field_key, option_ids in multi_value_fields.items():
+                post_data[field_key] = option_ids
+                self.logger.debug(f"Added multi-value field {field_key} with options: {option_ids}")
+            
+            if len(post_data) <= 2:  # Only 'entity' and 'user' keys
+                self.logger.debug(f"No custom field data to process for {table_name} entity {target_entity_id}")
+                return
+                
+            # Create a mock request object for the CustomFieldService
+            class MockRequest:
+                def __init__(self, post_data):
+                    self.POST = MockPostData(post_data)
+                    
+                def getlist(self, key, default=None):
+                    return self.POST.getlist(key, default)
+            
+            class MockPostData:
+                def __init__(self, data):
+                    self.data = data
+                    
+                def get(self, key, default=None):
+                    return self.data.get(key, default)
+                    
+                def getlist(self, key, default=None):
+                    value = self.data.get(key, default or [])
+                    if isinstance(value, list):
+                        return value
+                    return [value] if value is not None else (default or [])
+                    
+                def __contains__(self, key):
+                    return key in self.data
+                    
+                def __getitem__(self, key):
+                    return self.data[key]
+                    
+                def __setitem__(self, key, value):
+                    self.data[key] = value
+            
+            mock_request = MockRequest(post_data)
+            
+            # Initialize CustomFieldService with the prepared data
+            custom_field_service = CustomFieldService(
+                post=post_data,
+                table=table_name,
+                company=self.target_company,
+                edit=True,  # We're editing/updating the target entity
+                request=mock_request,
+                created_type='copy'  # Indicate this is a copy operation
+            )
+            
+            # Process the custom fields using the service
+            selected, errors = custom_field_service.process()
+            
+            if errors:
+                self.logger.warning(f"CustomFieldService encountered {len(errors)} errors for {table_name} entity {target_entity_id}")
+                for field_key, error_msg in errors.items():
+                    self.logger.error(f"CustomFieldService error for {field_key}: {error_msg}")
+                
+                # Fallback to original method if there are critical errors
+                self.logger.info(f"Falling back to original custom field copy method for {table_name} entity {target_entity_id}")
+                self.copy_all_custom_fields_for_entity(source_entity_id, target_entity_id, table_name)
+            else:
+                self.logger.info(f"Successfully processed {len(post_data) - 2} custom fields using CustomFieldService for {table_name} entity {target_entity_id}")
+                
+            # Update statistics
+            fields_processed = len(post_data) - 2  # Exclude 'entity' and 'user' keys
+            self.stats['custom_fields_copied'] += fields_processed
+            
+        except Exception as e:
+            self.logger.error(f"Error copying custom fields using service for {table_name}: {e}")
+            import traceback
+            self.logger.error(f"Traceback: {traceback.format_exc()}")
+            
+            # Fallback to original method
+            try:
+                self.logger.info(f"Attempting fallback to original custom field copy method for {table_name} entity {target_entity_id}")
+                self.copy_all_custom_fields_for_entity(source_entity_id, target_entity_id, table_name)
+            except Exception as fallback_error:
+                self.logger.error(f"Fallback method also failed for {table_name}: {fallback_error}")
     
     def debug_event_form_field_mapping(self, source_event_form, target_event_form):
         """
@@ -1678,25 +1878,29 @@ class ContactDataCopier:
                 logger.error(f"Error copying contact user file: {e}")
 
     def _copy_contact_custom_fields(self, source_contact, target_contact):
-        """Copy custom fields (CFieldValue and CFieldMultiValue) for contacts using CustomFieldHandler"""
+        """Copy custom fields (CFieldValue and CFieldMultiValue) for contacts using CustomFieldService"""
         try:
-            # Use the common CustomFieldHandler to copy all custom field data
-            self.custom_field_handler.copy_all_custom_fields_for_entity(
+            # Use the enhanced CustomFieldService-based approach for proper field handling
+            self.custom_field_handler.copy_custom_fields_using_service(
                 source_contact.id, 
                 target_contact.id, 
-                'contact'
+                'contact',
+                source_entity=source_contact,
+                target_entity=target_contact
             )
             
             # Update our stats from the handler's stats
             handler_stats = self.custom_field_handler.get_stats()
             self.stats.custom_fields_copied += (
                 handler_stats['custom_fields_copied'] + 
-                handler_stats['custom_field_values_copied'] + 
-                handler_stats['custom_field_multi_values_copied']
+                handler_stats.get('custom_field_values_copied', 0) + 
+                handler_stats.get('custom_field_multi_values_copied', 0)
             )
             
         except Exception as e:
             logger.error(f"Error copying contact custom fields: {e}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
 
     def copy_all_contact_data(self) -> ContactStats:
         """Execute the complete contact copy process"""
@@ -1898,21 +2102,23 @@ class ContactDataCopier:
             logger.error(f"Error copying OppPersonnel: {e}")
 
     def _copy_opp_custom_fields(self, source_opp, target_opp):
-        """Copy custom fields for opportunities using CustomFieldHandler"""
+        """Copy custom fields for opportunities using CustomFieldService"""
         try:
-            # Use the common CustomFieldHandler to copy all custom field data
-            self.custom_field_handler.copy_all_custom_fields_for_entity(
+            # Use the enhanced CustomFieldService-based approach for proper field handling
+            self.custom_field_handler.copy_custom_fields_using_service(
                 source_opp.id, 
                 target_opp.id, 
-                'opp'
+                'opp',
+                source_entity=source_opp,
+                target_entity=target_opp
             )
             
             # Update our stats from the handler's stats
             handler_stats = self.custom_field_handler.get_stats()
             self.stats.custom_fields_copied += (
                 handler_stats['custom_fields_copied'] + 
-                handler_stats['custom_field_values_copied'] + 
-                handler_stats['custom_field_multi_values_copied']
+                handler_stats.get('custom_field_values_copied', 0) + 
+                handler_stats.get('custom_field_multi_values_copied', 0)
             )
             
         except Exception as e:
@@ -2105,11 +2311,13 @@ class ContactDataCopier:
                 logger.error(f"Error copying ContactEventForm: {e}")
                 continue
 
-            # Copy CFieldValue and CFieldMultiValue entries using CustomFieldHandler
-            self.custom_field_handler.copy_all_custom_fields_for_entity(
+            # Copy CFieldValue and CFieldMultiValue entries using CustomFieldService
+            self.custom_field_handler.copy_custom_fields_using_service(
                 source_contact_event_form.id,
                 target_contact_event_form.id,
-                'event_form'
+                'eventform',  # Use 'eventform' as expected by CustomFieldService
+                source_entity=source_contact_event_form,
+                target_entity=target_contact_event_form
             )
 
 def parse_arguments() -> Tuple[int, int]:
