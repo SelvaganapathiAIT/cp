@@ -86,6 +86,9 @@ class ContactStats:
     research_copied: int = 0
     stores_copied: int = 0
     custom_fields_copied: int = 0
+    opp_histories_copied: int = 0
+    opp_contacts_copied: int = 0
+    opp_personnels_copied: int = 0
     errors: List[str] = field(default_factory=list)
 
 
@@ -2165,7 +2168,7 @@ def main():
     
     try:
         source_user_id = 19934
-        target_user_id = 19946
+        target_user_id = 19950
 
         # Create copier and execute
         copier = ContactDataCopier(source_user_id, target_user_id)
@@ -2187,64 +2190,6 @@ def main():
         sys.exit(1)
     finally:
         cleanup_process_lock(pid_file)
-
-
-def example_custom_field_usage():
-    """
-    Example showing how to use CustomFieldHandler independently
-    """
-    # Example usage of CustomFieldHandler for different scenarios
-    
-    # Initialize handler
-    source_company = Company.objects.get(pk=1)  # Replace with actual company ID
-    target_company = Company.objects.get(pk=2)  # Replace with actual company ID
-    source_user = User.objects.get(pk=1)        # Replace with actual user ID
-    target_user = User.objects.get(pk=2)        # Replace with actual user ID
-    
-    handler = CustomFieldHandler(
-        source_company, 
-        target_company, 
-        source_user, 
-        target_user, 
-        logger
-    )
-    
-    # Example 1: Copy all custom fields for a contact
-    # handler.copy_all_custom_fields_for_entity(
-    #     source_entity_id=123,  # Source contact ID
-    #     target_entity_id=456,  # Target contact ID
-    #     table_name='contact'
-    # )
-    
-    # Example 2: Copy custom fields for an opportunity
-    # handler.copy_all_custom_fields_for_entity(
-    #     source_entity_id=789,  # Source opportunity ID
-    #     target_entity_id=101,  # Target opportunity ID
-    #     table_name='opp'
-    # )
-    
-    # Example 3: Copy custom fields for an event form
-    # handler.copy_all_custom_fields_for_entity(
-    #     source_entity_id=112,  # Source event form ID
-    #     target_entity_id=113,  # Target event form ID
-    #     table_name='event_form'
-    # )
-    
-    # Example 4: Copy company-level configurations
-    # handler.copy_opp_form_cfields()
-    # handler.copy_cfield_autos('contact')
-    
-    # Example 5: Copy event form field relationships
-    # source_event_form = EventForm.objects.get(pk=1)
-    # target_event_form = EventForm.objects.get(pk=2)
-    # handler.copy_event_form_cfields(source_event_form, target_event_form)
-    
-    # Get statistics
-    stats = handler.get_stats()
-    print("Custom Field Copy Statistics:")
-    for key, value in stats.items():
-        if key != 'errors':
-            print(f"  {key}: {value}")
 
 
 if __name__ == "__main__":
