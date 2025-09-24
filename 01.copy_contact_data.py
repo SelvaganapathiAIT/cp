@@ -66,8 +66,8 @@ from cp.models import (
     UserFile,  EventFormContactType,EventFormEMail,ReportField,ReportFieldGroupBy
 )
 
-from cplib.cfield.custom_field_service import CustomFieldService
-
+#from cplib.cfield.custom_field_service import CustomFieldService
+from custom_field_service import CustomFieldService
 @dataclass
 class ContactStats:
     """Statistics for contact copy operations"""
@@ -3135,3 +3135,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
